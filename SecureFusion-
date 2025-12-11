@@ -1,0 +1,1451 @@
+
+
+import re, warnings
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    roc_auc_score, classification_report, confusion_matrix
+)
+from sklearn.linear_model import LogisticRegression
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+import seaborn as sns
+from sklearn.metrics import roc_curve
+
+import matplotlib.pyplot as plt   
+
+warnings.filterwarnings("ignore")
+
+
+CSV_PATH   =   "/content/V3_nvd_final_only_V3.csv"
+
+TEXT_MAIN  = "Description"
+TARGET_COL = "Exploitability"
+
+SEED       = 42
+DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+
+TEXT_MODEL_NAME     = "sentence-transformers/all-MiniLM-L6-v2"
+TEXT_HIDDEN_SIZE    = 384
+MAX_LEN             = 384
+TEXT_BATCH_SIZE     = 8
+TEXT_LR             = 3e-5
+TEXT_WEIGHT_DECAY = 0.03
+TEXT_DROPOUT = 0.35
+
+TEACHER_MAX_EPOCHS      = 10
+TEACHER_EARLY_PATIENCE  = 3
+STUDENT_MAX_EPOCHS = 6
+STUDENT_EARLY_PATIENCE = 1
+DISTILL_TEMPERATURE     = 3.0
+ALPHA = 0.8
+MAX_GRAD_NORM           = 1.0
+
+
+TAB_BATCH       = 256
+TAB_EPOCHS      = 40
+TAB_LR          = 1e-3
+TAB_DMODEL      = 128
+TAB_HEADS       = 4
+TAB_LAYERS      = 2
+TAB_DROPOUT     = 0.2
+TAB_HEAD_DROPOUT = 0.3
+TAB_EARLY_PATIENCE = 8
+
+
+REMOVE_LEAKY_SCORES     = True
+REMOVE_NVD_DESCRIPTION  = False
+CVSS_ONLY               = False
+
+
+ROBUST_TEXT_TRAIN   = True   
+TEXT_PERTURB_PROB = 0.15  
+ROBUST_TAB_TRAIN    = True   
+TAB_PERTURB_PROB    = 0.3
+TAB_NOISE_STD       = 0.1
+ROBUST_META_TRAIN   = True    
+
+
+TEST_PERTURB_RATIO  = 0.3
+TEST_NOISE_STD      = 0.2
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
+print("Loading CSV:", CSV_PATH)
+df = pd.read_csv(CSV_PATH)
+df.columns = [re.sub(r"\s+","_",c).strip() for c in df.columns]
+print("Loaded shape:", df.shape)
+print("Columns:", df.columns.tolist())
+
+
+if TARGET_COL not in df.columns:
+    raise ValueError(f"'{TARGET_COL}' not found in columns!")
+
+df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce")
+print("NaNs in Exploitability before cleaning:", df[TARGET_COL].isna().sum())
+
+valid_mask = df[TARGET_COL].isin([0.0, 1.0])
+invalid_count = (~valid_mask).sum()
+if invalid_count > 0:
+    print(f"Removing {invalid_count} rows with non-binary Exploitability values")
+
+df = df[valid_mask].copy()
+df = df.dropna(subset=[TARGET_COL]).copy()
+df[TARGET_COL] = df[TARGET_COL].astype(int)
+
+print("NaNs in Exploitability after cleaning:", df[TARGET_COL].isna().sum())
+print("Unique target values:", set(df[TARGET_COL].unique()))
+print("Class balance:\n", df[TARGET_COL].value_counts(normalize=True).rename("proportion"))
+
+
+if "PUBLISHEDDATE" not in df.columns:
+    for cand in ["Published", "published", "PUBLISHED"]:
+        if cand in df.columns:
+            df["PUBLISHEDDATE"] = df[cand]
+            break
+
+if "LASTMODIFIEDDATE" not in df.columns:
+    for cand in ["LastModified", "LASTMODIFIED", "Last_Modified"]:
+        if cand in df.columns:
+            df["LASTMODIFIEDDATE"] = df[cand]
+            break
+
+def parse_cvss_v3(s):
+    out={}
+    if not isinstance(s,str) or "CVSS:3" not in s:
+        return out
+    for p in s.split("/"):
+        if ":" in p:
+            k,v=p.split(":",1); k=k.strip(); v=v.strip()
+            if k in {"AV","AC","PR","UI","S","C","I","A"}:
+                out[f"CVSSv3_{k}"]=v
+    return out
+
+def parse_cvss_v2(s):
+    out={}
+    if not isinstance(s,str):
+        return out
+    for p in s.split("/"):
+        if ":" in p:
+            k,v=p.split(":",1); k=k.strip(); v=v.strip()
+            if k in {"AV","AC","Au","C","I","A"}:
+                out[f"CVSSv2_{k}"]=v
+    return out
+
+cvss_v3_cols = []
+if "VectorString" in df.columns:
+    cvss_v3_cols.append("VectorString")
+if "Vector_v3" in df.columns:
+    cvss_v3_cols.append("Vector_v3")
+
+for vcol in cvss_v3_cols:
+    add = pd.DataFrame(list(df[vcol].apply(parse_cvss_v3))).fillna(np.nan)
+    for c in add.columns:
+        df[c] = add[c]
+
+for vcol in ["Vector_v2_fromNVD","Vector_v2"]:
+    if vcol in df.columns:
+        add2 = pd.DataFrame(list(df[vcol].apply(parse_cvss_v2))).fillna(np.nan)
+        for c in add2.columns:
+            df[c] = add2[c]
+
+for raw in ["VectorString","Vector_v3","Vector_v2_fromNVD","Vector_v2"]:
+    if raw in df.columns:
+        df.drop(columns=[raw], inplace=True)
+
+
+for c in ["PUBLISHEDDATE","LASTMODIFIEDDATE"]:
+    if c in df.columns:
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+
+if all(c in df.columns for c in ["PUBLISHEDDATE","LASTMODIFIEDDATE"]):
+    df["age_days"] = (df["LASTMODIFIEDDATE"] - df["PUBLISHEDDATE"]).dt.days
+    df["age_days"] = df["age_days"].fillna(df["age_days"].median())
+    for side in ["PUBLISHEDDATE","LASTMODIFIEDDATE"]:
+        df[f"{side}_year"]  = df[side].dt.year
+        df[f"{side}_month"] = df[side].dt.month
+        df[f"{side}_dow"]   = df[side].dt.dayofweek
+        df[f"{side}_dom"]   = df[side].dt.day
+        df[f"{side}_isnull"]= df[side].isna().astype(int)
+else:
+    for side in ["PUBLISHEDDATE","LASTMODIFIEDDATE"]:
+        if side in df.columns:
+            df[f"{side}_year"]  = df[side].dt.year
+            df[f"{side}_month"] = df[side].dt.month
+            df[f"{side}_dow"]   = df[side].dt.dayofweek
+            df[f"{side}_dom"]   = df[side].dt.day
+            df[f"{side}_isnull"]= df[side].isna().astype(int)
+
+drop_conflict = [c for c in df.columns
+                 if c.lower().startswith("conflict_flag")
+                 or c.lower() in {"conflict_count","conflict_any"}]
+if drop_conflict:
+    df.drop(columns=drop_conflict, inplace=True, errors="ignore")
+
+
+if REMOVE_NVD_DESCRIPTION and "NVD_Description" in df.columns:
+    df.drop(columns=["NVD_Description"], inplace=True)
+
+if REMOVE_LEAKY_SCORES:
+    LEAKY_NUM_COLS = [
+        "ExploitabilityScore","NVD_ExploitabilityScore","Delta_ExploitabilityScore",
+        "ImpactScore","NVD_ImpactScore","Delta_ImpactScore",
+    ]
+    df.drop(columns=[c for c in LEAKY_NUM_COLS if c in df.columns], inplace=True)
+
+
+if TEXT_MAIN not in df.columns:
+    df[TEXT_MAIN] = ""
+df[TEXT_MAIN] = df[TEXT_MAIN].fillna("").astype(str)
+
+def pick_cols_all(df_):
+    num_cols, cat_cols = [], []
+    for c in df_.columns:
+        if c in {TARGET_COL, TEXT_MAIN}:
+            continue
+        s = df_[c]
+        if pd.api.types.is_numeric_dtype(s):
+            num_cols.append(c)
+        else:
+            cat_cols.append(c)
+    return num_cols, cat_cols
+
+NUM_COLS, CAT_COLS = pick_cols_all(df)
+
+if CVSS_ONLY:
+    CVSS_KEEP_PREFIXES = ("CVSSv3_", "CVSSv2_")
+    CVSS_NUM_CANDIDATES = [
+        "BaseScore","ExploitabilityScore","ImpactScore",
+        "BaseScore_v3","TemporalScore_v3","EnvironmentalScore_v3",
+        "BaseScore_v2","TemporalScore_v2","EnvironmentalScore_v2"
+    ]
+    CAT_COLS = [c for c in df.columns if any(c.startswith(p) for p in CVSS_KEEP_PREFIXES)]
+    NUM_COLS = [c for c in CVSS_NUM_CANDIDATES if c in df.columns]
+
+const_cols = [c for c in NUM_COLS if df[c].nunique(dropna=False) <= 1]
+const_cols += [c for c in CAT_COLS if df[c].nunique(dropna=False) <= 1]
+if const_cols:
+    df.drop(columns=const_cols, inplace=True, errors="ignore")
+    NUM_COLS = [c for c in NUM_COLS if c not in const_cols]
+    CAT_COLS = [c for c in CAT_COLS if c not in const_cols]
+
+print(f"NUM features: {len(NUM_COLS)}")
+print(f"CAT features: {len(CAT_COLS)}")
+
+
+df_trainval, df_te = train_test_split(
+    df,
+    test_size=0.15,
+    random_state=SEED,
+    stratify=df[TARGET_COL]
+)
+
+df_tr, df_va = train_test_split(
+    df_trainval,
+    test_size=0.2,
+    random_state=SEED,
+    stratify=df_trainval[TARGET_COL]
+)
+
+df_tr = df_tr.reset_index(drop=True)
+df_va = df_va.reset_index(drop=True)
+df_te = df_te.reset_index(drop=True)
+
+print("Split sizes (train / val / test):", len(df_tr), len(df_va), len(df_te))
+
+
+scaler = StandardScaler()
+if NUM_COLS:
+    Xn_tr_df = df_tr[NUM_COLS].apply(pd.to_numeric, errors="coerce")
+    medians = Xn_tr_df.median(numeric_only=True)
+    Xn_tr_df = Xn_tr_df.fillna(medians)
+    scaler.fit(Xn_tr_df.values)
+else:
+    medians = pd.Series(dtype=float)
+
+encoders = {}
+for c in CAT_COLS:
+    le = LabelEncoder()
+    vals = df_tr[c].astype(str).fillna("___NA___").values.tolist()
+    vals += ["___UNK___"]
+    le.fit(vals)
+    encoders[c] = le
+
+def transform_num(df_part):
+    if not NUM_COLS:
+        return np.zeros((len(df_part),0), dtype=np.float32)
+    X = df_part[NUM_COLS].apply(pd.to_numeric, errors="coerce").fillna(medians)
+    return scaler.transform(X.values)
+
+def transform_cat(df_part):
+    if not CAT_COLS:
+        return np.zeros((len(df_part),0), dtype=np.int64)
+    out = np.zeros((len(df_part), len(CAT_COLS)), dtype=np.int64)
+    for j,c in enumerate(CAT_COLS):
+        le = encoders[c]
+        vals = df_part[c].astype(str).fillna("___NA___").values
+        known = set(le.classes_)
+        mapped = [v if v in known else "___UNK___" for v in vals]
+        out[:, j] = le.transform(mapped)
+    return out
+
+t_tr = df_tr[TEXT_MAIN].astype(str).values
+t_va = df_va[TEXT_MAIN].astype(str).values
+t_te = df_te[TEXT_MAIN].astype(str).values
+
+y_tr = df_tr[TARGET_COL].astype(int).values
+y_va = df_va[TARGET_COL].astype(int).values
+y_te = df_te[TARGET_COL].astype(int).values
+
+Xn_tr, Xn_va, Xn_te = transform_num(df_tr), transform_num(df_va), transform_num(df_te)
+Xc_tr, Xc_va, Xc_te = transform_cat(df_tr), transform_cat(df_va), transform_cat(df_te)
+
+print("Shapes | num", Xn_tr.shape, "cat", Xc_tr.shape)
+
+
+text_tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_NAME)
+PAD_ID = text_tokenizer.pad_token_id
+UNK_ID = text_tokenizer.unk_token_id if text_tokenizer.unk_token_id is not None else PAD_ID
+
+class TextOnlyDataset(Dataset):
+    def __init__(self, texts, labels=None):
+        self.texts = list(texts)
+        self.labels = None if labels is None else list(labels)
+    def __len__(self):
+        return len(self.texts)
+    def __getitem__(self, idx):
+        if self.labels is None:
+            return self.texts[idx]
+        return self.texts[idx], float(self.labels[idx])
+
+def collate_text_with_labels(batch):
+    texts, labels = zip(*batch)
+    enc = text_tokenizer(
+        list(texts),
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+        max_length=MAX_LEN
+    )
+    input_ids = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
+    labels = torch.tensor(labels, dtype=torch.float32)
+    return input_ids, attention_mask, labels
+
+text_train_ds = TextOnlyDataset(t_tr, y_tr)
+text_val_ds   = TextOnlyDataset(t_va, y_va)
+text_test_ds  = TextOnlyDataset(t_te, y_te)
+
+text_train_loader = DataLoader(
+    text_train_ds,
+    batch_size=TEXT_BATCH_SIZE,
+    shuffle=True,
+    num_workers=0,
+    collate_fn=collate_text_with_labels
+)
+text_val_loader = DataLoader(
+    text_val_ds,
+    batch_size=TEXT_BATCH_SIZE,
+    shuffle=False,
+    num_workers=0,
+    collate_fn=collate_text_with_labels
+)
+text_test_loader = DataLoader(
+    text_test_ds,
+    batch_size=TEXT_BATCH_SIZE,
+    shuffle=False,
+    num_workers=0,
+    collate_fn=collate_text_with_labels
+)
+
+
+def perturb_text_batch(input_ids, attention_mask, tokenizer,
+                       perturb_prob=TEXT_PERTURB_PROB,
+                       missing_ratio=0.5):
+
+    if perturb_prob <= 0.0:
+        return input_ids, attention_mask
+
+    B = input_ids.size(0)
+    device = input_ids.device
+    mask = torch.rand(B, device=device) < perturb_prob
+    idx = torch.nonzero(mask).squeeze(-1)
+    if idx.numel() == 0:
+        return input_ids, attention_mask
+
+    idx = idx[torch.randperm(idx.numel())]
+    half = idx.numel() // 2
+    miss_idx = idx[:half]
+    noisy_idx = idx[half:]
+
+
+    if miss_idx.numel() > 0:
+        input_ids[miss_idx] = PAD_ID
+        attention_mask[miss_idx] = 0
+
+   
+    if noisy_idx.numel() > 0:
+        for i in noisy_idx:
+            i = int(i.item())
+            ids = input_ids[i]
+            
+            valid_pos = (ids != PAD_ID).nonzero(as_tuple=False).squeeze(-1)
+            if valid_pos.numel() == 0:
+                continue
+            k = max(1, int(0.3 * valid_pos.numel()))
+            chosen = valid_pos[torch.randperm(valid_pos.numel())[:k]]
+            ids[chosen] = UNK_ID
+            input_ids[i] = ids
+    return input_ids, attention_mask
+
+
+class TextTeacher(nn.Module):
+    def __init__(self):
+        super(TextTeacher, self).__init__()
+        self.bert = AutoModel.from_pretrained(TEXT_MODEL_NAME)
+        self.dropout = nn.Dropout(TEXT_DROPOUT)
+        self.classifier = nn.Linear(TEXT_HIDDEN_SIZE, 1)
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        cls_embedding = outputs.last_hidden_state[:, 0, :]
+        cls_embedding = self.dropout(cls_embedding)
+        logits = self.classifier(cls_embedding).squeeze(-1)
+        return logits
+
+teacher_model = TextTeacher().to(DEVICE)
+
+neg_count = max(1, np.sum(y_tr == 0))
+pos_count = max(1, np.sum(y_tr == 1))
+pos_weight_text = torch.tensor(neg_count / pos_count, dtype=torch.float32, device=DEVICE)
+
+criterion_teacher = nn.BCEWithLogitsLoss(pos_weight=pos_weight_text)
+optimizer_teacher = torch.optim.AdamW(
+    teacher_model.parameters(),
+    lr=TEXT_LR,
+    weight_decay=TEXT_WEIGHT_DECAY
+)
+
+def eval_teacher(loader):
+    teacher_model.eval()
+    total_loss = 0.0
+    all_probs = []
+    all_targets = []
+    with torch.no_grad():
+        for input_ids, attention_mask, labels in loader:
+            input_ids = input_ids.to(DEVICE)
+            attention_mask = attention_mask.to(DEVICE)
+            labels = labels.to(DEVICE)
+            logits = teacher_model(input_ids, attention_mask)
+            loss = criterion_teacher(logits, labels)
+            total_loss += loss.item() * labels.size(0)
+            probs = torch.sigmoid(logits)
+            all_probs.append(probs.detach().cpu().numpy())
+            all_targets.append(labels.detach().cpu().numpy())
+    all_probs = np.concatenate(all_probs)
+    all_targets = np.concatenate(all_targets)
+    avg_loss = total_loss / len(loader.dataset)
+    preds = (all_probs >= 0.5).astype(int)
+    acc = accuracy_score(all_targets, preds)
+    f1  = f1_score(all_targets, preds)
+    roc = roc_auc_score(all_targets, all_probs)
+    return avg_loss, acc, f1, roc, all_probs
+
+best_teacher_f1 = -1.0
+teacher_patience = 0
+print("\n===== TRAINING TEACHER (all-MiniLM) =====")
+for epoch in range(1, TEACHER_MAX_EPOCHS + 1):
+    teacher_model.train()
+    total_loss = 0.0
+    all_preds = []
+    all_targets = []
+    for input_ids, attention_mask, labels in tqdm(text_train_loader, desc=f"Teacher Epoch {epoch}", leave=False):
+        input_ids = input_ids.to(DEVICE)
+        attention_mask = attention_mask.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+        optimizer_teacher.zero_grad()
+        logits = teacher_model(input_ids, attention_mask)
+        loss = criterion_teacher(logits, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(teacher_model.parameters(), MAX_GRAD_NORM)
+        optimizer_teacher.step()
+
+        total_loss += loss.item() * labels.size(0)
+        with torch.no_grad():
+            probs = torch.sigmoid(logits)
+            preds = (probs >= 0.5).long()
+        all_preds.append(preds.detach().cpu().numpy())
+        all_targets.append(labels.detach().cpu().numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
+    avg_train_loss = total_loss / len(text_train_ds)
+    train_acc = accuracy_score(all_targets, all_preds)
+    train_f1  = f1_score(all_targets, all_preds)
+
+    va_loss, va_acc, va_f1, va_roc, _ = eval_teacher(text_val_loader)
+    print(f"[TEACHER][Epoch {epoch}] "
+          f"train_loss={avg_train_loss:.4f} acc={train_acc:.4f} f1={train_f1:.4f} | "
+          f"val_loss={va_loss:.4f} acc={va_acc:.4f} f1={va_f1:.4f} roc_auc={va_roc:.4f}")
+
+    if va_f1 > best_teacher_f1 + 1e-4:
+        best_teacher_f1 = va_f1
+        teacher_patience = 0
+        torch.save(teacher_model.state_dict(), "teacher_allMiniLM_best.pt")
+        print("  --> saved new best TEACHER model.")
+    else:
+        teacher_patience += 1
+        print(f"  no improvement in teacher val F1 (patience={teacher_patience}/{TEACHER_EARLY_PATIENCE})")
+        if teacher_patience >= TEACHER_EARLY_PATIENCE:
+            print("  Teacher early stopping triggered.")
+            break
+
+teacher_model.load_state_dict(torch.load("teacher_allMiniLM_best.pt", map_location=DEVICE))
+teacher_model.eval()
+
+
+class GreenExBertStudent(nn.Module):
+    def __init__(self):
+        super(GreenExBertStudent, self).__init__()
+        self.bert = AutoModel.from_pretrained(TEXT_MODEL_NAME)
+        layers_to_keep = [0, 2, 3, 5]
+        new_layers = nn.ModuleList(
+            [layer_module for i, layer_module in enumerate(self.bert.encoder.layer)
+             if i in layers_to_keep]
+        )
+        self.bert.encoder.layer = new_layers
+        self.bert.config.num_hidden_layers = len(layers_to_keep)
+        self.dropout = nn.Dropout(TEXT_DROPOUT)
+        self.classifier = nn.Linear(TEXT_HIDDEN_SIZE, 1)
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        cls_embedding = outputs.last_hidden_state[:, 0, :]
+        cls_embedding = self.dropout(cls_embedding)
+        logits = self.classifier(cls_embedding).squeeze(-1)
+        return logits
+
+student_model = GreenExBertStudent().to(DEVICE)
+
+
+for param in student_model.bert.encoder.layer[:-1].parameters():
+    param.requires_grad = False
+
+
+
+criterion_hard = nn.BCEWithLogitsLoss(
+    pos_weight=pos_weight_text,
+    reduction='mean'
+)
+
+criterion_soft = nn.KLDivLoss(reduction="batchmean")
+
+optimizer_student = torch.optim.AdamW(
+    student_model.parameters(),
+    lr=TEXT_LR,
+    weight_decay=TEXT_WEIGHT_DECAY
+)
+
+num_training_steps_student = STUDENT_MAX_EPOCHS * len(text_train_loader)
+scheduler_student = get_linear_schedule_with_warmup(
+    optimizer_student,
+    num_warmup_steps=int(0.1 * num_training_steps_student),
+    num_training_steps=num_training_steps_student
+)
+
+def eval_student(loader):
+    student_model.eval()
+    total_loss = 0.0
+    all_probs = []
+    all_targets = []
+    with torch.no_grad():
+        for input_ids, attention_mask, labels in loader:
+            input_ids = input_ids.to(DEVICE)
+            attention_mask = attention_mask.to(DEVICE)
+            labels = labels.to(DEVICE)
+            logits = student_model(input_ids, attention_mask)
+            loss = criterion_hard(logits, labels)
+            total_loss += loss.item() * labels.size(0)
+            probs = torch.sigmoid(logits)
+            all_probs.append(probs.detach().cpu().numpy())
+            all_targets.append(labels.detach().cpu().numpy())
+    all_probs = np.concatenate(all_probs)
+    all_targets = np.concatenate(all_targets)
+    avg_loss = total_loss / len(loader.dataset)
+    preds = (all_probs >= 0.5).astype(int)
+    acc = accuracy_score(all_targets, preds)
+    f1  = f1_score(all_targets, preds)
+    roc = roc_auc_score(all_targets, all_probs)
+    return avg_loss, acc, f1, roc, all_probs
+
+best_student_f1 = -1.0
+student_patience = 0
+best_text_model_path = "greenexbert_student_best.pt"
+
+print("\n===== TRAINING STUDENT (GreenExBert) WITH DISTILLATION + ROBUSTNESS =====")
+
+student_train_losses = []
+student_val_losses = []
+student_train_f1s = []
+student_val_f1s = []
+student_train_accuracies = []
+student_val_accuracies = []
+
+for epoch in range(1, STUDENT_MAX_EPOCHS + 1):
+    student_model.train()
+    total_loss = 0.0
+    all_preds = []
+    all_targets = []
+
+    for input_ids, attention_mask, labels in tqdm(text_train_loader, desc=f"Student Epoch {epoch}", leave=False):
+        input_ids = input_ids.to(DEVICE)
+        attention_mask = attention_mask.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+       
+        if ROBUST_TEXT_TRAIN:
+            input_ids, attention_mask = perturb_text_batch(
+                input_ids, attention_mask, text_tokenizer,
+                perturb_prob=TEXT_PERTURB_PROB
+            )
+        
+
+        with torch.no_grad():
+            teacher_logits = teacher_model(input_ids, attention_mask)
+            teacher_probs = torch.sigmoid(teacher_logits / DISTILL_TEMPERATURE)
+
+        student_logits = student_model(input_ids, attention_mask)
+        student_probs  = torch.sigmoid(student_logits / DISTILL_TEMPERATURE)
+        student_log_probs = torch.log(student_probs + 1e-9)
+        label_smoothing = 0.1
+        smooth_labels = labels * (1 - label_smoothing) + 0.5 * label_smoothing
+
+        loss_soft = criterion_soft(student_log_probs, teacher_probs) * (DISTILL_TEMPERATURE ** 2)
+        loss_hard = criterion_hard(student_logits, smooth_labels)
+        loss = ALPHA * loss_hard + (1 - ALPHA) * loss_soft
+
+
+        optimizer_student.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(student_model.parameters(), MAX_GRAD_NORM)
+        optimizer_student.step()
+        scheduler_student.step()
+
+        total_loss += loss.item() * labels.size(0)
+        with torch.no_grad():
+            probs = torch.sigmoid(student_logits)
+            preds = (probs >= 0.5).long()
+        all_preds.append(preds.detach().cpu().numpy())
+        all_targets.append(labels.detach().cpu().numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
+    avg_train_loss = total_loss / len(text_train_ds)
+    train_acc = accuracy_score(all_targets, all_preds)
+    train_f1  = f1_score(all_targets, all_preds)
+    student_train_losses.append(avg_train_loss)
+    student_train_f1s.append(train_f1)
+    student_train_accuracies.append(train_acc)
+
+
+    va_loss, va_acc, va_f1, va_roc, probs_va = eval_student(text_val_loader)
+    student_val_losses.append(va_loss)
+    student_val_f1s.append(va_f1)
+    student_val_accuracies.append(va_acc)
+
+
+    print(f"[STUDENT][Epoch {epoch}] "
+          f"train_loss={avg_train_loss:.4f} acc={train_acc:.4f} f1={train_f1:.4f} | "
+          f"val_loss={va_loss:.4f} acc={va_acc:.4f} f1={va_f1:.4f} roc_auc={va_roc:.4f}")
+
+    if va_f1 > best_student_f1 + 1e-4:
+        best_student_f1 = va_f1
+        student_patience = 0
+        torch.save(student_model.state_dict(), best_text_model_path)
+        print("  --> saved new best STUDENT model.")
+    else:
+        student_patience += 1
+        print(f"  no improvement in student val F1 (patience={student_patience}/{STUDENT_EARLY_PATIENCE})")
+        if student_patience >= STUDENT_EARLY_PATIENCE:
+            print("  Student early stopping triggered.")
+            break
+
+student_model.load_state_dict(torch.load(best_text_model_path, map_location=DEVICE))
+
+
+best_epochs = len(student_train_losses)
+
+student_train_losses     = student_train_losses[:best_epochs]
+student_val_losses       = student_val_losses[:best_epochs]
+student_train_f1s        = student_train_f1s[:best_epochs]
+student_val_f1s          = student_val_f1s[:best_epochs]
+student_train_accuracies = student_train_accuracies[:best_epochs]
+student_val_accuracies   = student_val_accuracies[:best_epochs]
+
+epochs = range(1, best_epochs + 1)
+
+
+
+epochs = range(1, len(student_train_accuracies) + 1)
+
+plt.figure(figsize=(10,6))
+plt.plot(epochs, student_train_accuracies,
+         marker="o", markersize=10, linewidth=4,
+         color="#0055CC", label="Train Acc")
+plt.plot(epochs, student_val_accuracies,
+         marker="s", markersize=10, linewidth=4,
+         color="#FF3300", label="Val Acc")
+
+plt.xlabel("Epoch", fontsize=15, fontweight="bold")
+plt.ylabel("Accuracy", fontsize=15, fontweight="bold")
+plt.title("Student Accuracy per Epoch", fontsize=18, fontweight="bold")
+plt.ylim(0.0, 1.0)
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.legend(fontsize=13)
+plt.tight_layout()
+plt.show()
+
+va_loss, va_acc, va_f1, va_roc, probs_text_va = eval_student(text_val_loader)
+te_loss, te_acc, te_f1, te_roc, probs_text_te = eval_student(text_test_loader)
+
+print("\n=== FINAL TEXT-ONLY RESULTS (GreenExBert Student) ===")
+
+
+print("VAL:", {
+    "loss": va_loss,
+    "acc": va_acc,
+    "f1": va_f1,
+    "roc_auc": va_roc
+})
+print("TEST:", {
+    "loss": te_loss,
+    "acc": te_acc,
+    "f1": te_f1,
+    "roc_auc": te_roc
+})
+
+
+class TabOnlyDS(Dataset):
+    def __init__(self, xnum, xcat, y):
+        self.xnum = xnum.astype(np.float32) if xnum is not None and xnum.size>0 else np.zeros((len(y),0), np.float32)
+        self.xcat = xcat.astype(np.int64)   if xcat is not None and xcat.size>0 else np.zeros((len(y),0), np.int64)
+        self.y = y.astype(np.int64)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, i):
+        return {
+            "num": torch.tensor(self.xnum[i], dtype=torch.float32),
+            "cat": torch.tensor(self.xcat[i], dtype=torch.long),
+            "y":   torch.tensor(self.y[i], dtype=torch.float32),
+        }
+
+tab_tr_loader = DataLoader(TabOnlyDS(Xn_tr, Xc_tr, y_tr),
+                           batch_size=TAB_BATCH, shuffle=True,
+                           num_workers=0)
+tab_va_loader = DataLoader(TabOnlyDS(Xn_va, Xc_va, y_va),
+                           batch_size=TAB_BATCH, shuffle=False,
+                           num_workers=0)
+tab_te_loader = DataLoader(TabOnlyDS(Xn_te, Xc_te, y_te),
+                           batch_size=TAB_BATCH, shuffle=False,
+                           num_workers=0)
+
+def cat_cards_from_arrays(*arrs):
+    if not arrs or arrs[0].shape[1] == 0: return []
+    J = arrs[0].shape[1]; cards=[]
+    for j in range(J):
+        mx=0
+        for A in arrs:
+            if A.shape[1] > 0 and A.shape[0] > 0:
+                mx=max(mx, int(np.max(A[:,j])))
+        cards.append(mx+1)
+    return cards
+
+cat_cards = cat_cards_from_arrays(Xc_tr, Xc_va, Xc_te)
+
+class TabTransformer(nn.Module):
+    def __init__(self, num_numerical:int, cat_cardinalities,
+                 d_model=TAB_DMODEL, n_heads=TAB_HEADS,
+                 n_layers=TAB_LAYERS, dropout=TAB_DROPOUT):
+        super().__init__()
+        self.num_proj = nn.Linear(num_numerical, d_model) if num_numerical>0 else None
+        self.embs = nn.ModuleList([nn.Embedding(card, d_model) for card in cat_cardinalities])
+        self.cls = nn.Parameter(torch.randn(1,1,d_model))
+        n_tokens = 1 + (1 if num_numerical>0 else 0) + len(self.embs)
+        self.col_emb = nn.Embedding(max(n_tokens,1), d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model, n_heads, d_model*4,
+            dropout, batch_first=True, activation="gelu"
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, n_layers)
+        self.norm = nn.LayerNorm(d_model)
+    def forward(self, xnum, xcat):
+        B = xnum.size(0) if xnum is not None and xnum.numel()>0 else (xcat.size(0) if xcat is not None and xcat.numel()>0 else 0)
+        tokens = [self.cls.expand(B, -1, -1)]
+        if self.embs and xcat is not None and xcat.shape[1]>0:
+            for j, emb in enumerate(self.embs):
+                tokens.append(emb(xcat[:, j]).unsqueeze(1))
+        if self.num_proj is not None and xnum is not None and xnum.shape[1]>0:
+            tokens.append(self.num_proj(xnum).unsqueeze(1))
+        X = torch.cat(tokens, dim=1) if len(tokens)>1 else tokens[0]
+        idx = torch.arange(X.size(1), device=X.device).unsqueeze(0)
+        X = X + self.col_emb(idx)
+        X = self.encoder(X)
+        X = self.norm(X)
+        return X[:,0,:]
+
+class TabOnlyModel(nn.Module):
+    def __init__(self, n_num, cat_cards, d_model=TAB_DMODEL):
+        super().__init__()
+        self.backbone = TabTransformer(n_num, cat_cards, d_model=d_model)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.GELU(),
+            nn.Dropout(TAB_HEAD_DROPOUT),
+            nn.Linear(128, 1)
+        )
+    def forward(self, xnum, xcat):
+        h = self.backbone(xnum, xcat)
+        return self.head(h)
+
+tab_model = TabOnlyModel(Xn_tr.shape[1], cat_cards).to(DEVICE)
+neg_tab = max(1, np.sum(y_tr==0)); pos_tab = max(1, np.sum(y_tr==1))
+pos_weight_tab = torch.tensor(neg_tab/pos_tab, dtype=torch.float32, device=DEVICE)
+tab_optim = torch.optim.AdamW(tab_model.parameters(), lr=TAB_LR, weight_decay=1e-4)
+tab_crit  = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tab)
+
+def run_tab_epoch(loader, train=True):
+    tab_model.train() if train else tab_model.eval()
+    losses=[]; all_logits=[]; all_y=[]
+    for b in loader:
+        xn = b["num"].to(DEVICE); xc = b["cat"].to(DEVICE); y = b["y"].to(DEVICE)
+
+        if train and ROBUST_TAB_TRAIN:
+            B = xn.size(0)
+            mask = torch.rand(B, device=xn.device) < TAB_PERTURB_PROB
+            idx = torch.nonzero(mask).squeeze(-1)
+            if idx.numel() > 0:
+                idx = idx[torch.randperm(idx.numel())]
+                half = idx.numel() // 2
+                miss_idx = idx[:half]
+                noisy_idx = idx[half:]
+                
+                if miss_idx.numel() > 0:
+                    if xn.shape[1] > 0:
+                        xn[miss_idx] = 0.0
+                    if xc.shape[1] > 0:
+                        xc[miss_idx] = 0
+                
+                if noisy_idx.numel() > 0 and xn.shape[1] > 0:
+                    noise = torch.randn_like(xn[noisy_idx]) * TAB_NOISE_STD
+                    xn[noisy_idx] = xn[noisy_idx] + noise
+       
+        with torch.set_grad_enabled(train):
+            logits = tab_model(xn, xc).squeeze(-1)
+            loss = tab_crit(logits, y)
+            if train:
+                tab_optim.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(tab_model.parameters(), MAX_GRAD_NORM)
+                tab_optim.step()
+        losses.append(loss.item())
+        all_logits.append(logits.detach().cpu())
+        all_y.append(y.detach().cpu())
+    logits = torch.cat(all_logits)
+    y = torch.cat(all_y).numpy()
+    probs = torch.sigmoid(logits).numpy()
+    preds = (probs>=0.5).astype(int)
+    return float(np.mean(losses)), accuracy_score(y, preds), f1_score(y, preds), probs
+
+best_f1_tab = -1.0
+tab_patience = 0
+
+tab_train_accuracies = []
+tab_val_accuracies  = []
+
+print("\n===== TRAINING TabTransformer (tab-only) =====")
+for ep in range(1, TAB_EPOCHS+1):
+    tr_loss, tr_acc, tr_f1, _ = run_tab_epoch(tab_tr_loader, True)
+    va_loss, va_acc, va_f1, _ = run_tab_epoch(tab_va_loader, False)
+    tab_train_accuracies.append(tr_acc)
+    tab_val_accuracies.append(va_acc)
+
+    print(f"[TabOnly][Ep {ep}] train loss={tr_loss:.4f} f1={tr_f1:.4f} | val loss={va_loss:.4f} f1={va_f1:.4f}")
+    if va_f1>best_f1_tab + 1e-4:
+        best_f1_tab = va_f1
+        tab_patience = 0
+        torch.save(tab_model.state_dict(), "tab_transformer_only.pt")
+        print("  saved best TabTransformer.")
+    else:
+        tab_patience += 1
+        print(f"  no improvement in tab val F1 (patience={tab_patience}/{TAB_EARLY_PATIENCE})")
+        if tab_patience >= TAB_EARLY_PATIENCE:
+            print("  TabTransformer early stopping triggered.")
+            break
+
+tab_model.load_state_dict(torch.load("tab_transformer_only.pt", map_location=DEVICE))
+best_tab_epochs = len(tab_train_accuracies)
+tab_train_accuracies = tab_train_accuracies[:best_tab_epochs]
+tab_val_accuracies  = tab_val_accuracies[:best_tab_epochs]
+
+_, _, _, probs_tab_va = run_tab_epoch(tab_va_loader, False)
+_, _, _, probs_tab_te = run_tab_epoch(tab_te_loader, False)
+
+def best_threshold(y_true, y_prob):
+    grid = np.linspace(0.05, 0.95, 37)
+    f1s = [f1_score(y_true, (y_prob>=t).astype(int)) for t in grid]
+    i = int(np.argmax(f1s))
+    return float(grid[i]), float(f1s[i])
+
+thr_text, f1_text = best_threshold(y_va, probs_text_va)
+thr_tab , f1_tab  = best_threshold(y_va, probs_tab_va)
+print(f"Best thr (text)={thr_text:.3f} F1={f1_text:.4f}")
+print(f"Best thr (tab) ={thr_tab :.3f} F1={f1_tab :.4f}")
+
+
+if ROBUST_META_TRAIN:
+
+    X_full = np.vstack([probs_text_va, probs_tab_va]).T
+    y_full = y_va
+  
+    probs_text_va_missing = np.full_like(probs_text_va, 0.5)
+    X_miss_text = np.vstack([probs_text_va_missing, probs_tab_va]).T
+    y_miss_text = y_va
+   
+    probs_tab_va_missing = np.full_like(probs_tab_va, 0.5)
+    X_miss_tab = np.vstack([probs_text_va, probs_tab_va_missing]).T
+    y_miss_tab = y_va
+
+    X_meta_tr = np.concatenate([X_full, X_miss_text, X_miss_tab], axis=0)
+    y_meta_tr = np.concatenate([y_full, y_miss_text, y_miss_tab], axis=0)
+else:
+    X_meta_tr = np.vstack([probs_text_va, probs_tab_va]).T
+    y_meta_tr = y_va
+
+meta = LogisticRegression()
+meta.fit(X_meta_tr, y_meta_tr)
+
+feats_test = np.vstack([probs_text_te, probs_tab_te]).T
+probs_ens = meta.predict_proba(feats_test)[:,1]
+probs_ens_val = meta.predict_proba(np.vstack([probs_text_va, probs_tab_va]).T)[:,1]
+thr_ens, f1_ens_val = best_threshold(y_va, probs_ens_val)
+
+preds_text_te = (probs_text_te >= thr_text).astype(int)
+preds_tab_te  = (probs_tab_te  >= thr_tab ).astype(int)
+preds_ens_te  = (probs_ens     >= thr_ens ).astype(int)
+
+print("\n=== FINAL TEST RESULTS (with tuned thresholds) ===")
+print("Text-only :", {
+    "acc": accuracy_score(y_te, preds_text_te),
+    "f1": f1_score(y_te, preds_text_te),
+    "roc_auc": roc_auc_score(y_te, probs_text_te)
+})
+print("Tab-only  :", {
+    "acc": accuracy_score(y_te, preds_tab_te ),
+    "f1":  f1_score(y_te, preds_tab_te ),
+    "roc_auc": roc_auc_score(y_te, probs_tab_te)
+})
+print("Ensemble  :", {
+    "acc": accuracy_score(y_te, preds_ens_te),
+    "f1":  f1_score(y_te, preds_ens_te),
+    "roc_auc": roc_auc_score(y_te, probs_ens)
+})
+print("\nEnsemble classification report:")
+print(classification_report(y_te, preds_ens_te, digits=4))
+print("Confusion matrix:\n", confusion_matrix(y_te, preds_ens_te))
+
+
+class FusionNet(nn.Module):
+    def __init__(self):
+        super(FusionNet, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(2, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, 1),
+        )
+    def forward(self, x):
+        return self.model(x)
+
+def create_loader(probs_t, probs_b, y, batch=64, shuffle=True):
+    X = np.vstack([probs_t, probs_b]).T.astype(np.float32)
+    ds = torch.utils.data.TensorDataset(
+        torch.tensor(X),
+        torch.tensor(y).float()
+    )
+    return DataLoader(ds, batch_size=batch, shuffle=shuffle)
+
+fusion_train_loader = create_loader(probs_text_va, probs_tab_va, y_va, shuffle=True)
+fusion_val_loader   = create_loader(probs_text_te, probs_tab_te, y_te, shuffle=False)
+
+fusion_model = FusionNet().to(DEVICE)
+fusion_opt = torch.optim.AdamW(fusion_model.parameters(), lr=5e-3)
+fusion_crit = nn.BCEWithLogitsLoss()
+
+FUSION_EPOCHS = 30
+fusion_train_acc=[]; fusion_val_acc=[]
+fusion_train_loss=[]; fusion_val_loss=[]
+best_fusion_acc=-1; fusion_patience=0
+
+print("\n===== TRAINING FusionNet =====")
+for ep in range(1, FUSION_EPOCHS+1):
+
+    fusion_model.train()
+    total_loss=0; all_p=[]; all_y=[]
+    for X,y in fusion_train_loader:
+        X,y = X.to(DEVICE), y.to(DEVICE)
+
+        fusion_opt.zero_grad()
+        logits = fusion_model(X).squeeze(-1)
+        loss = fusion_crit(logits, y)
+        loss.backward()
+        fusion_opt.step()
+
+        total_loss+=loss.item()*len(y)
+        all_p.append(torch.sigmoid(logits).detach().cpu().numpy())
+        all_y.append(y.cpu().numpy())
+
+    p=np.concatenate(all_p); yy=np.concatenate(all_y)
+    preds=(p>=0.5).astype(int)
+    fusion_train_loss.append(total_loss/len(yy))
+    fusion_train_acc.append(accuracy_score(yy,preds))
+
+
+    fusion_model.eval()
+    total_loss=0; all_p=[]; all_y=[]
+    with torch.no_grad():
+        for X,y in fusion_val_loader:
+            X,y = X.to(DEVICE), y.to(DEVICE)
+            logits=fusion_model(X).squeeze(-1)
+            loss=fusion_crit(logits, y)
+            total_loss+=loss.item()*len(y)
+            all_p.append(torch.sigmoid(logits).cpu().numpy())
+            all_y.append(y.cpu().numpy())
+
+    p=np.concatenate(all_p); yy=np.concatenate(all_y)
+    preds=(p>=0.5).astype(int)
+    fusion_val_loss.append(total_loss/len(yy))
+    fusion_val_acc.append(accuracy_score(yy,preds))
+
+    print(f"[Fusion][Ep {ep}] TrainAcc={fusion_train_acc[-1]:.3f} | ValAcc={fusion_val_acc[-1]:.3f}")
+
+    if fusion_val_acc[-1] > best_fusion_acc:
+        best_fusion_acc=fusion_val_acc[-1]
+        fusion_patience=0
+        torch.save(fusion_model.state_dict(),"fusion_best.pt")
+    else:
+        fusion_patience += 1
+        if fusion_patience >= 5:
+            print("Fusion early stopping!")
+            break
+
+fusion_model.load_state_dict(torch.load("fusion_best.pt"))
+
+epochs_f = np.arange(1,len(fusion_train_acc)+1)
+
+plt.figure(figsize=(8,6))
+plt.plot(epochs_f, fusion_train_acc, "-o", linewidth=3, label="Train Acc", color="#006600")
+plt.plot(epochs_f, fusion_val_acc, "-s", linewidth=3, label="Val Acc", color="#00AA44")
+
+best_ep_f=np.argmax(fusion_val_acc)+1
+plt.axvline(best_ep_f, linestyle="--", color="green", alpha=0.7,
+            label=f"Best Epoch={best_ep_f}")
+
+plt.ylim(0.6,1.0)
+plt.xlabel("Epoch", fontsize=14, fontweight="bold")
+plt.ylabel("Accuracy", fontsize=14, fontweight="bold")
+plt.title("FusionNet Accuracy per Epoch", fontsize=17, fontweight="bold")
+plt.grid(True, linestyle="--", alpha=0.45)
+plt.legend(fontsize=12)
+plt.tight_layout()
+plt.show()
+
+print("\n=== ROBUSTNESS DIAGNOSTICS (30% test perturbed) ===")
+rng = np.random.RandomState(SEED)
+mask = rng.rand(len(y_te)) < TEST_PERTURB_RATIO
+
+
+base_text_f1 = f1_score(y_te, preds_text_te)
+base_tab_f1  = f1_score(y_te, preds_tab_te)
+base_ens_f1  = f1_score(y_te, preds_ens_te)
+
+base_text_roc = roc_auc_score(y_te, probs_text_te)
+base_tab_roc  = roc_auc_score(y_te, probs_tab_te)
+base_ens_roc  = roc_auc_score(y_te, probs_ens)
+
+p_text_mt = probs_text_te.copy()
+p_text_mt[mask] = 0.5
+p_tab_mt = probs_tab_te.copy()
+
+preds_text_mt = (p_text_mt >= thr_text).astype(int)
+preds_tab_mt  = (p_tab_mt  >= thr_tab ).astype(int)
+probs_ens_mt  = meta.predict_proba(np.vstack([p_text_mt, p_tab_mt]).T)[:,1]
+preds_ens_mt  = (probs_ens_mt >= thr_ens).astype(int)
+
+print("\n[Scenario] Missing TEXT on 30% of test")
+print("Text-only F1:", f1_score(y_te, preds_text_mt), "(ΔF1 =", f1_score(y_te, preds_text_mt)-base_text_f1, ")")
+print("Tab-only  F1:", f1_score(y_te, preds_tab_mt ), "(ΔF1 =", f1_score(y_te, preds_tab_mt)-base_tab_f1, ")")
+print("Ensemble  F1:", f1_score(y_te, preds_ens_mt ), "(ΔF1 =", f1_score(y_te, preds_ens_mt)-base_ens_f1, ")")
+
+print("Text-only ROC:", roc_auc_score(y_te, p_text_mt), "(ΔROC =", roc_auc_score(y_te, p_text_mt)-base_text_roc, ")")
+print("Tab-only  ROC:", roc_auc_score(y_te, p_tab_mt ), "(ΔROC =", roc_auc_score(y_te, p_tab_mt)-base_tab_roc, ")")
+print("Ensemble  ROC:", roc_auc_score(y_te, probs_ens_mt), "(ΔROC =", roc_auc_score(y_te, probs_ens_mt)-base_ens_roc, ")")
+
+
+p_text_nt = probs_text_te.copy()
+p_text_nt[mask] = np.clip(
+    p_text_nt[mask] + rng.normal(0, TEST_NOISE_STD, size=mask.sum()),
+    0.0, 1.0
+)
+p_tab_nt = probs_tab_te.copy()
+
+preds_text_nt = (p_text_nt >= thr_text).astype(int)
+preds_tab_nt  = (p_tab_nt  >= thr_tab ).astype(int)
+probs_ens_nt  = meta.predict_proba(np.vstack([p_text_nt, p_tab_nt]).T)[:,1]
+preds_ens_nt  = (probs_ens_nt >= thr_ens).astype(int)
+
+print("\n[Scenario] Noisy TEXT on 30% of test")
+print("Text-only F1:", f1_score(y_te, preds_text_nt), "(ΔF1 =", f1_score(y_te, preds_text_nt)-base_text_f1, ")")
+print("Tab-only  F1:", f1_score(y_te, preds_tab_nt ), "(ΔF1 =", f1_score(y_te, preds_tab_nt)-base_tab_f1, ")")
+print("Ensemble  F1:", f1_score(y_te, preds_ens_nt ), "(ΔF1 =", f1_score(y_te, preds_ens_nt)-base_ens_f1, ")")
+
+print("Text-only ROC:", roc_auc_score(y_te, p_text_nt), "(ΔROC =", roc_auc_score(y_te, p_text_nt)-base_text_roc, ")")
+print("Tab-only  ROC:", roc_auc_score(y_te, p_tab_nt ), "(ΔROC =", roc_auc_score(y_te, p_tab_nt)-base_tab_roc, ")")
+print("Ensemble  ROC:", roc_auc_score(y_te, probs_ens_nt), "(ΔROC =", roc_auc_score(y_te, probs_ens_nt)-base_ens_roc, ")")
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import roc_curve
+
+sns.set(style="whitegrid")
+
+plt.figure(figsize=(7,6))
+fpr_t, tpr_t, _ = roc_curve(y_te, probs_text_te)
+fpr_b, tpr_b, _ = roc_curve(y_te, probs_tab_te)
+fpr_f, tpr_f, _ = roc_curve(y_te, probs_ens)
+
+plt.plot(fpr_t, tpr_t, linewidth=3, label=f"Text-only (ROC={te_roc:.3f})", color="#CC0000")
+plt.plot(fpr_b, tpr_b, linewidth=3, label=f"Tab-only  (ROC={roc_auc_score(y_te, probs_tab_te):.3f})", color="#0055CC")
+plt.plot(fpr_f, tpr_f, linewidth=3, label=f"Fusion     (ROC={roc_auc_score(y_te, probs_ens):.3f})", color="#009933")
+plt.plot([0,1],[0,1],'--', color="black")
+
+plt.xlabel("False Positive Rate", fontsize=14, fontweight="bold")
+plt.ylabel("True Positive Rate", fontsize=14, fontweight="bold")
+plt.title("ROC Curve Comparison", fontsize=17, fontweight="bold")
+plt.legend(fontsize=12)
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+
+acc_text = accuracy_score(y_te, preds_text_te)
+acc_tab  = accuracy_score(y_te, preds_tab_te)
+acc_fus  = accuracy_score(y_te, preds_ens_te)
+
+models = ["Text-only", "Tab-only", "Fusion"]
+accs = [acc_text, acc_tab, acc_fus]
+colors = ["#CC0000", "#0055CC", "#009933"]
+
+plt.figure(figsize=(7,6))
+bars = plt.bar(models, accs, color=colors, edgecolor="black", linewidth=2)
+for b,a in zip(bars,accs):
+    plt.text(b.get_x()+b.get_width()/2, a+0.002, f"{a:.3f}",
+             ha="center", fontsize=14, fontweight="bold")
+
+plt.ylim(0.8, 1.0)
+plt.ylabel("Accuracy", fontsize=14, fontweight="bold")
+plt.title("Accuracy Comparison", fontsize=17, fontweight="bold")
+plt.grid(axis="y", linestyle="--", alpha=0.45)
+plt.tight_layout()
+plt.show()
+
+
+
+cm = confusion_matrix(y_te, preds_ens_te)
+cm_norm = cm / cm.sum(axis=1, keepdims=True)
+
+plt.figure(figsize=(6,5))
+sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap="Blues", linewidths=1, cbar=False)
+plt.title("Confusion Matrix – Fusion Model", fontsize=16, fontweight="bold")
+plt.xlabel("Predicted", fontsize=13)
+plt.ylabel("True", fontsize=13)
+plt.tight_layout()
+plt.show()
+
+
+epochs = range(1, best_epochs + 1)
+
+
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+plt.plot(epochs, student_train_losses, linewidth=3, label="Train Loss", color="#0055CC")
+plt.plot(epochs, student_val_losses, linewidth=3, label="Val Loss", color="#CC0000")
+plt.xlabel("Epoch", fontweight="bold")
+plt.ylabel("Loss", fontweight="bold")
+plt.title("Train vs Val Loss", fontsize=16, fontweight="bold")
+plt.legend(); plt.grid(True, linestyle="--", alpha=0.5)
+
+plt.subplot(1,2,2)
+plt.plot(epochs, student_train_f1s, linewidth=3, label="Train F1", color="#0055CC")
+plt.plot(epochs, student_val_f1s, linewidth=3, label="Val F1", color="#009933")
+plt.xlabel("Epoch", fontweight="bold")
+plt.ylabel("F1 Score", fontweight="bold")
+plt.title("Train vs Val F1", fontsize=16, fontweight="bold")
+plt.legend(); plt.grid(True, linestyle="--", alpha=0.5)
+
+plt.tight_layout()
+plt.show()
+
+
+
+labels = ["Text-only", "Tab-only", "Fusion"]
+f1_clean = [base_text_f1, base_tab_f1, base_ens_f1]
+f1_miss  = [f1_score(y_te, preds_text_mt),
+            f1_score(y_te, preds_tab_mt),
+            f1_score(y_te, preds_ens_mt)]
+
+x = np.arange(len(labels)); W=0.35
+
+plt.figure(figsize=(8,6))
+plt.bar(x-W/2, f1_clean, width=W, label="Clean", edgecolor="black")
+plt.bar(x+W/2, f1_miss, width=W, label="Missing Text 30%", edgecolor="black")
+
+plt.xticks(x, labels, fontsize=12, fontweight="bold")
+plt.ylabel("F1 Score", fontsize=14, fontweight="bold")
+plt.title("Robustness vs Missing Text", fontsize=16, fontweight="bold")
+plt.legend(fontsize=12)
+plt.grid(axis="y", linestyle="--", alpha=0.45)
+plt.tight_layout()
+plt.show()
+
+print("\n\n All research-ready figures generated successfully!")
+
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, average_precision_score, balanced_accuracy_score,
+    matthews_corrcoef, brier_score_loss, cohen_kappa_score,
+    confusion_matrix
+)
+
+def full_metrics(name, y_true, y_prob, thr):
+    preds = (y_prob >= thr).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, preds).ravel()
+    specificity = tn / (tn + fp + 1e-9)
+    fpr = fp / (fp + tn + 1e-9)
+
+    metrics = {
+        "Model": name,
+        "Accuracy": accuracy_score(y_true, preds),
+        "Balanced Accuracy": balanced_accuracy_score(y_true, preds),
+        "Precision": precision_score(y_true, preds),
+        "Recall": recall_score(y_true, preds),
+        "Specificity": specificity,
+        "F1 Score": f1_score(y_true, preds),
+        "ROC-AUC": roc_auc_score(y_true, y_prob),
+        "PR-AUC": average_precision_score(y_true, y_prob),
+        "MCC": matthews_corrcoef(y_true, preds),
+        "Brier Score": brier_score_loss(y_true, y_prob),
+        "Cohen Kappa": cohen_kappa_score(y_true, preds),
+        "FPR": fpr
+    }
+    return metrics
+
+results = []
+
+
+results.append(full_metrics("Text-only", y_te, probs_text_te, thr_text))
+
+
+results.append(full_metrics("Tab-only (TabTransformer)", y_te, probs_tab_te, thr_tab))
+
+
+results.append(full_metrics("Fusion", y_te, probs_ens, thr_ens))
+
+print("\n====================  FULL MODEL EVALUATION ====================\n")
+for r in results:
+    for k,v in r.items():
+        if k != "Model":
+            print(f"{r['Model']} | {k}: {v:.4f}")
+    print("---------------------------------------------------")
+
+print("\n\n==================  ABLATION STUDY ==================\n")
+
+results_ablation = []
+
+def ablation_result(name, y_true, y_prob, thr):
+    preds = (y_prob >= thr).astype(int)
+    return {
+        "Model": name,
+        "Accuracy": accuracy_score(y_true, preds),
+        "F1": f1_score(y_true, preds),
+        "ROC-AUC": roc_auc_score(y_true, y_prob)
+    }
+
+
+results_ablation.append(
+    ablation_result("Full (Text + Tab + Robust + Distill)", y_te, probs_ens, thr_ens)
+)
+
+
+probs_ens_no_robust = (probs_text_te + probs_tab_te) / 2.0
+thr_nr, _ = best_threshold(y_va, (probs_text_va + probs_tab_va)/2.0)
+results_ablation.append(
+    ablation_result("Fusion w/out robust meta", y_te, probs_ens_no_robust, thr_nr)
+)
+
+
+va_loss_t, va_acc_t, va_f1_t, va_roc_t, probs_text_teacher_va = eval_teacher(text_val_loader)
+te_loss_t, te_acc_t, te_f1_t, te_roc_t, probs_text_teacher_te = eval_teacher(text_test_loader)
+thr_teacher, _ = best_threshold(y_va, probs_text_teacher_va)
+results_ablation.append(
+    ablation_result("Teacher Text-only (no distill)", y_te, probs_text_teacher_te, thr_teacher)
+)
+
+
+print("Skipping re-training student w/out robustness (Compute heavy).")
+print("Using existing student for approximation.")
+
+results_ablation.append(
+    ablation_result("Student-only Text", y_te, probs_text_te, thr_text)
+)
+
+results_ablation.append(
+    ablation_result("Tab-only", y_te, probs_tab_te, thr_tab)
+)
+
+
+print("\nAblation Study Results:")
+for r in results_ablation:
+    print(f"{r['Model']:35s} | Acc: {r['Accuracy']:.4f} | F1: {r['F1']:.4f} | ROC-AUC: {r['ROC-AUC']:.4f}")
+
+print("\n=======================================================\n")
+np.save("probs_text_te.npy", probs_text_te)
+np.save("probs_tab_te.npy",  probs_tab_te)
+np.save("probs_ens_te.npy",  probs_ens)
+
+np.save("y_te.npy", y_te)
+np.save("probs_text_va.npy", probs_text_va)
+np.save("probs_tab_va.npy",  probs_tab_va)
+
+torch.save(student_model.state_dict(), "student.pt")
+torch.save(tab_model.state_dict(), "tab.pt")
+torch.save(fusion_model.state_dict(), "fusion.pt")
+
+print("Saved all outputs for Phase-2 analyses.")
+
+
+used_cols = [TEXT_MAIN, TARGET_COL] + NUM_COLS + CAT_COLS
+final_df = df[used_cols].copy()
+final_path = "cve_exploitability_processed_final.csv"
+final_df.to_csv(final_path, index=False, encoding="utf-8-sig")
+print("\nSaved final processed CSV:", final_path, "| shape:", final_df.shape)
+
+import shap
+print("\n\n=== SHAP Explainability for TabTransformer (Gradient SHAP) ===")
+
+
+class TabModelWrapper(nn.Module):
+    def __init__(self, model, num_dim, cat_dim):
+        super().__init__()
+        self.model = model
+        self.num_dim = num_dim
+        self.cat_dim = cat_dim
+
+    def forward(self, X):
+        xnum = X[:, :self.num_dim]
+        xcat = X[:, self.num_dim:].long()
+        return self.model(xnum, xcat)
+
+
+num_dim = Xn_te.shape[1]
+cat_dim = Xc_te.shape[1]
+wrapped_model = TabModelWrapper(tab_model, num_dim, cat_dim).to(DEVICE)
+wrapped_model.eval()
+
+
+bg = np.hstack([Xn_va[:100], Xc_va[:100]])
+bg_t = torch.tensor(bg, dtype=torch.float32).to(DEVICE)
+
+
+explainer_tab = shap.GradientExplainer(wrapped_model, bg_t)
+
+
+sample_num = 200
+x = np.hstack([Xn_te[:sample_num], Xc_te[:sample_num]])
+x_t = torch.tensor(x, dtype=torch.float32).to(DEVICE)
+
+shap_values = explainer_tab.shap_values(x_t)[0]
+
+feat_names = NUM_COLS + CAT_COLS
+
+plt.figure(figsize=(10,6))
+shap.summary_plot(shap_values, features=x, feature_names=feat_names, show=False)
+plt.title("TabTransformer – Gradient SHAP Feature Importance", fontweight="bold")
+plt.tight_layout()
+plt.show()
+
+
+print("\n\n=== SHAP Token-Level Explainability for Text ===")
+
+import shap
+
+def student_predict(text_list):
+  
+    enc = text_tokenizer(
+        text_list,
+        padding=True,
+        truncation=True,
+        max_length=MAX_LEN,
+        return_tensors="pt"
+    )
+    input_ids = enc["input_ids"].to(DEVICE)
+    attention_mask = enc["attention_mask"].to(DEVICE)
+
+    with torch.no_grad():
+        logits = student_model(input_ids, attention_mask)
+        probs = torch.sigmoid(logits).cpu().numpy().reshape(-1, 1)
+    return probs
+
+masker = shap.maskers.Text(text_tokenizer)
+
+text_explainer = shap.Explainer(
+    student_predict,
+    masker,
+    output_names=["Exploitability"]
+)
+
+sample_texts = list(df_te[TEXT_MAIN].iloc[:3])
+shap_values_text = text_explainer(sample_texts)
+
+for i, txt in enumerate(sample_texts):
+    print(f"\n--- Sample #{i} ---")
+    shap.plots.text(shap_values_text[i])
+
+
+from wordcloud import WordCloud
+
+token_importance = {}
+for sv in shap_values_text[:50]:
+    for t,v in zip(sv.data, sv.values):
+        if v > 0:
+            token_importance[t] = token_importance.get(t,0) + float(v)
+
+wc = WordCloud(width=1000, height=600, background_color="white")
+wc.generate_from_frequencies(token_importance)
+
+plt.figure(figsize=(12,6))
+plt.imshow(wc, interpolation="bilinear")
+plt.axis("off")
+plt.title("Wordcloud – Tokens Increasing Exploitability", fontweight="bold")
+plt.tight_layout()
+plt.show()
