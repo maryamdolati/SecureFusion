@@ -1,0 +1,662 @@
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    matthews_corrcoef,
+    cohen_kappa_score,
+    brier_score_loss,
+    confusion_matrix,
+)
+
+# ============================================================
+# 0) Safety checks
+# ============================================================
+
+print("Checking required variables for leakage-free robustness sensitivity analysis...")
+
+required_vars = [
+    "student_model",
+    "tab_model",
+    "decision_fusion",
+    "probs_tab_te",
+    "thr_text",
+    "thr_tab",
+    "t_te",
+    "y_te",
+    "Xn_te",
+    "Xc_te",
+    "predict_text_probs",
+]
+
+missing_required = [v for v in required_vars if v not in globals()]
+
+if missing_required:
+    raise RuntimeError(
+        "Missing required variables. Run the leakage-free full training/evaluation code first. "
+        f"Missing: {missing_required}"
+    )
+
+# Support both names: thr_decision from ablation code, thr_fusion from main tuned code.
+if "thr_decision" in globals():
+    fusion_threshold = thr_decision
+    print("Using fusion threshold from thr_decision:", fusion_threshold)
+elif "thr_fusion" in globals():
+    fusion_threshold = thr_fusion
+    print("Using fusion threshold from thr_fusion:", fusion_threshold)
+else:
+    raise RuntimeError(
+        "No fusion threshold found. Expected either thr_decision or thr_fusion."
+    )
+
+# Leakage check, if variables exist from the leakage-free pipeline.
+if "leakage_check_cols" in globals() and "df" in globals():
+    still_df = [c for c in leakage_check_cols if c in df.columns]
+    print("\nLeakage safety check:")
+    print("Still in dataframe:", still_df)
+
+    if "NUM_COLS" in globals():
+        still_num = [c for c in leakage_check_cols if c in NUM_COLS]
+        print("Still in NUM_COLS:", still_num)
+    else:
+        still_num = []
+
+    if "CAT_COLS" in globals():
+        still_cat = [c for c in leakage_check_cols if c in CAT_COLS]
+        print("Still in CAT_COLS:", still_cat)
+    else:
+        still_cat = []
+
+    if len(still_df) > 0 or len(still_num) > 0 or len(still_cat) > 0:
+        raise RuntimeError(
+            "Leakage columns are still present. Re-run the corrected leakage-free training code first."
+        )
+
+if "removed_leakage_cols" in globals():
+    print("Removed leakage columns:", removed_leakage_cols)
+
+print("\nSensitivity analysis will use the currently trained leakage-free models.")
+
+
+# ============================================================
+# 1) Metric utilities
+# ============================================================
+
+def safe_roc_auc(y_true, y_prob):
+    try:
+        return float(roc_auc_score(y_true, y_prob))
+    except Exception:
+        return np.nan
+
+
+def safe_pr_auc(y_true, y_prob):
+    try:
+        return float(average_precision_score(y_true, y_prob))
+    except Exception:
+        return np.nan
+
+
+def compute_metrics_simple(y_true, y_prob, threshold):
+    y_pred = (y_prob >= threshold).astype(int)
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    specificity = tn / (tn + fp + 1e-12)
+    fpr = fp / (fp + tn + 1e-12)
+
+    return {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Balanced_Accuracy": balanced_accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred, zero_division=0),
+        "Recall": recall_score(y_true, y_pred, zero_division=0),
+        "Specificity": specificity,
+        "F1": f1_score(y_true, y_pred, zero_division=0),
+        "ROC_AUC": safe_roc_auc(y_true, y_prob),
+        "PR_AUC": safe_pr_auc(y_true, y_prob),
+        "MCC": matthews_corrcoef(y_true, y_pred),
+        "Brier": brier_score_loss(y_true, y_prob),
+        "Kappa": cohen_kappa_score(y_true, y_pred),
+        "FPR": fpr,
+    }
+
+
+# ============================================================
+# 2) Text corruption functions
+# ============================================================
+
+def corrupt_texts_missing(texts, ratio=0.30, seed=42):
+    """
+    Replace ratio% of descriptions with empty strings.
+    """
+    rng = np.random.default_rng(seed)
+    texts_corrupt = np.array(texts, dtype=object).copy()
+
+    n = len(texts_corrupt)
+    k = int(round(ratio * n))
+
+    if k <= 0:
+        return texts_corrupt
+
+    idx = rng.choice(n, size=k, replace=False)
+    texts_corrupt[idx] = ""
+
+    return texts_corrupt
+
+
+def corrupt_texts_noisy(texts, ratio=0.30, token_noise_ratio=0.30, seed=42):
+    """
+    Select ratio% of descriptions and replace token_noise_ratio% of tokens with [UNK].
+    """
+    rng = np.random.default_rng(seed)
+    texts_corrupt = np.array(texts, dtype=object).copy()
+
+    n = len(texts_corrupt)
+    k_docs = int(round(ratio * n))
+
+    if k_docs <= 0:
+        return texts_corrupt
+
+    idx = rng.choice(n, size=k_docs, replace=False)
+
+    for i in idx:
+        tokens = str(texts_corrupt[i]).split()
+
+        if len(tokens) == 0:
+            continue
+
+        k_tokens = max(1, int(round(token_noise_ratio * len(tokens))))
+        chosen = rng.choice(len(tokens), size=k_tokens, replace=False)
+
+        for j in chosen:
+            tokens[j] = "[UNK]"
+
+        texts_corrupt[i] = " ".join(tokens)
+
+    return texts_corrupt
+
+
+# ============================================================
+# 3) Sensitivity loop
+# ============================================================
+
+sensitivity_rows = []
+
+def add_result_row(model_name, degradation_type, ratio, metrics):
+    row = {
+        "Model": model_name,
+        "Degradation_Type": degradation_type,
+        "Ratio": ratio,
+        "Ratio_%": int(round(ratio * 100)),
+    }
+    row.update(metrics)
+    sensitivity_rows.append(row)
+
+
+degradation_ratios = [0.0, 0.10, 0.20, 0.30, 0.40, 0.50]
+TOKEN_NOISE_RATIO = 0.30
+
+print("\nRunning leakage-free robustness sensitivity analysis...")
+print("Ratios:", degradation_ratios)
+print("Token noise ratio inside selected noisy descriptions:", TOKEN_NOISE_RATIO)
+
+
+for ratio in degradation_ratios:
+    print(f"\n================ Ratio: {int(ratio * 100)}% ================")
+
+    # ========================================================
+    # A) Missing-text setting
+    # ========================================================
+    t_te_missing_ratio = corrupt_texts_missing(
+        t_te,
+        ratio=ratio,
+        seed=SEED
+    )
+
+    probs_text_missing_ratio = predict_text_probs(
+        student_model,
+        t_te_missing_ratio,
+        y_te
+    )
+
+    # Tabular branch is unchanged because only text is degraded.
+    probs_tab_missing_ratio = probs_tab_te.copy()
+
+    probs_decision_missing_ratio = decision_fusion.predict_proba(
+        np.vstack([probs_text_missing_ratio, probs_tab_missing_ratio]).T
+    )[:, 1]
+
+    text_missing_metrics = compute_metrics_simple(
+        y_te,
+        probs_text_missing_ratio,
+        thr_text
+    )
+
+    tab_missing_metrics = compute_metrics_simple(
+        y_te,
+        probs_tab_missing_ratio,
+        thr_tab
+    )
+
+    decision_missing_metrics = compute_metrics_simple(
+        y_te,
+        probs_decision_missing_ratio,
+        fusion_threshold
+    )
+
+    add_result_row(
+        "TextGuard-Lite",
+        "Missing Text",
+        ratio,
+        text_missing_metrics
+    )
+
+    add_result_row(
+        "TabShield-Net",
+        "Missing Text",
+        ratio,
+        tab_missing_metrics
+    )
+
+    add_result_row(
+        "SecureFusion-X Decision-level",
+        "Missing Text",
+        ratio,
+        decision_missing_metrics
+    )
+
+    # Optional: feature-level fusion baseline, if available.
+    if "make_mm_loader" in globals() and "run_feature_fusion_epoch" in globals() and "thr_ff" in globals():
+        mm_te_missing_ratio_loader = make_mm_loader(
+            t_te_missing_ratio,
+            Xn_te,
+            Xc_te,
+            y_te,
+            shuffle=False
+        )
+
+        ff_missing_ratio = run_feature_fusion_epoch(
+            mm_te_missing_ratio_loader,
+            train=False
+        )
+
+        feature_missing_metrics = compute_metrics_simple(
+            y_te,
+            ff_missing_ratio["probs"],
+            thr_ff
+        )
+
+        add_result_row(
+            "Feature-level Concatenation",
+            "Missing Text",
+            ratio,
+            feature_missing_metrics
+        )
+
+    print(
+        f"Missing Text | "
+        f"Text F1={text_missing_metrics['F1']:.4f} | "
+        f"Tab F1={tab_missing_metrics['F1']:.4f} | "
+        f"SecureFusion-X F1={decision_missing_metrics['F1']:.4f}"
+    )
+
+    # ========================================================
+    # B) Noisy-text setting
+    # ========================================================
+    t_te_noisy_ratio = corrupt_texts_noisy(
+        t_te,
+        ratio=ratio,
+        token_noise_ratio=TOKEN_NOISE_RATIO,
+        seed=SEED
+    )
+
+    probs_text_noisy_ratio = predict_text_probs(
+        student_model,
+        t_te_noisy_ratio,
+        y_te
+    )
+
+    # Tabular branch is unchanged because only text is degraded.
+    probs_tab_noisy_ratio = probs_tab_te.copy()
+
+    probs_decision_noisy_ratio = decision_fusion.predict_proba(
+        np.vstack([probs_text_noisy_ratio, probs_tab_noisy_ratio]).T
+    )[:, 1]
+
+    text_noisy_metrics = compute_metrics_simple(
+        y_te,
+        probs_text_noisy_ratio,
+        thr_text
+    )
+
+    tab_noisy_metrics = compute_metrics_simple(
+        y_te,
+        probs_tab_noisy_ratio,
+        thr_tab
+    )
+
+    decision_noisy_metrics = compute_metrics_simple(
+        y_te,
+        probs_decision_noisy_ratio,
+        fusion_threshold
+    )
+
+    add_result_row(
+        "TextGuard-Lite",
+        "Noisy Text",
+        ratio,
+        text_noisy_metrics
+    )
+
+    add_result_row(
+        "TabShield-Net",
+        "Noisy Text",
+        ratio,
+        tab_noisy_metrics
+    )
+
+    add_result_row(
+        "SecureFusion-X Decision-level",
+        "Noisy Text",
+        ratio,
+        decision_noisy_metrics
+    )
+
+    # Optional: feature-level fusion baseline, if available.
+    if "make_mm_loader" in globals() and "run_feature_fusion_epoch" in globals() and "thr_ff" in globals():
+        mm_te_noisy_ratio_loader = make_mm_loader(
+            t_te_noisy_ratio,
+            Xn_te,
+            Xc_te,
+            y_te,
+            shuffle=False
+        )
+
+        ff_noisy_ratio = run_feature_fusion_epoch(
+            mm_te_noisy_ratio_loader,
+            train=False
+        )
+
+        feature_noisy_metrics = compute_metrics_simple(
+            y_te,
+            ff_noisy_ratio["probs"],
+            thr_ff
+        )
+
+        add_result_row(
+            "Feature-level Concatenation",
+            "Noisy Text",
+            ratio,
+            feature_noisy_metrics
+        )
+
+    print(
+        f"Noisy Text   | "
+        f"Text F1={text_noisy_metrics['F1']:.4f} | "
+        f"Tab F1={tab_noisy_metrics['F1']:.4f} | "
+        f"SecureFusion-X F1={decision_noisy_metrics['F1']:.4f}"
+    )
+
+
+# ============================================================
+# 4) Full results dataframe
+# ============================================================
+
+sensitivity_df = pd.DataFrame(sensitivity_rows)
+
+display_cols = [
+    "Model",
+    "Degradation_Type",
+    "Ratio_%",
+    "Accuracy",
+    "Balanced_Accuracy",
+    "Precision",
+    "Recall",
+    "Specificity",
+    "F1",
+    "ROC_AUC",
+    "PR_AUC",
+    "MCC",
+    "Brier",
+    "Kappa",
+    "FPR",
+]
+
+sensitivity_df = sensitivity_df[display_cols].copy()
+
+for c in sensitivity_df.columns:
+    if c not in ["Model", "Degradation_Type"]:
+        sensitivity_df[c] = sensitivity_df[c].astype(float).round(4)
+
+print("\n================ FULL ROBUSTNESS SENSITIVITY RESULTS - LEAKAGE-FREE ================")
+display(sensitivity_df)
+
+full_out_path = "/content/robustness_sensitivity_full_results_leakage_free.csv"
+sensitivity_df.to_csv(full_out_path, index=False)
+print("Saved:", full_out_path)
+
+
+# ============================================================
+# 5) Reviewer-focused compact table
+# ============================================================
+
+reviewer_models = [
+    "TextGuard-Lite",
+    "TabShield-Net",
+    "SecureFusion-X Decision-level",
+]
+
+if "Feature-level Concatenation" in sensitivity_df["Model"].unique():
+    reviewer_models.append("Feature-level Concatenation")
+
+reviewer_sensitivity = sensitivity_df[
+    sensitivity_df["Model"].isin(reviewer_models)
+][
+    [
+        "Model",
+        "Degradation_Type",
+        "Ratio_%",
+        "F1",
+        "ROC_AUC",
+        "PR_AUC",
+        "MCC",
+        "Brier",
+        "FPR",
+    ]
+].copy()
+
+print("\n================ REVIEWER TABLE: ROBUSTNESS SENSITIVITY - LEAKAGE-FREE ================")
+display(reviewer_sensitivity)
+
+reviewer_out_path = "/content/reviewer_robustness_sensitivity_table_leakage_free.csv"
+reviewer_sensitivity.to_csv(reviewer_out_path, index=False)
+print("Saved:", reviewer_out_path)
+
+
+# ============================================================
+# 6) Pivot tables for manuscript
+# ============================================================
+
+f1_pivot = reviewer_sensitivity.pivot_table(
+    index=["Degradation_Type", "Ratio_%"],
+    columns="Model",
+    values="F1"
+).reset_index()
+
+print("\n================ F1 PIVOT TABLE FOR MANUSCRIPT - LEAKAGE-FREE ================")
+display(f1_pivot)
+
+f1_pivot_path = "/content/robustness_sensitivity_f1_pivot_leakage_free.csv"
+f1_pivot.to_csv(f1_pivot_path, index=False)
+print("Saved:", f1_pivot_path)
+
+roc_pivot = reviewer_sensitivity.pivot_table(
+    index=["Degradation_Type", "Ratio_%"],
+    columns="Model",
+    values="ROC_AUC"
+).reset_index()
+
+roc_pivot_path = "/content/robustness_sensitivity_roc_auc_pivot_leakage_free.csv"
+roc_pivot.to_csv(roc_pivot_path, index=False)
+print("Saved:", roc_pivot_path)
+
+prauc_pivot = reviewer_sensitivity.pivot_table(
+    index=["Degradation_Type", "Ratio_%"],
+    columns="Model",
+    values="PR_AUC"
+).reset_index()
+
+prauc_pivot_path = "/content/robustness_sensitivity_pr_auc_pivot_leakage_free.csv"
+prauc_pivot.to_csv(prauc_pivot_path, index=False)
+print("Saved:", prauc_pivot_path)
+
+
+# ============================================================
+# 7) Plot: Missing Text F1
+# ============================================================
+
+missing_plot_df = reviewer_sensitivity[
+    reviewer_sensitivity["Degradation_Type"] == "Missing Text"
+].copy()
+
+plt.figure(figsize=(8, 5))
+
+for model_name in missing_plot_df["Model"].unique():
+    temp = missing_plot_df[missing_plot_df["Model"] == model_name]
+    plt.plot(
+        temp["Ratio_%"],
+        temp["F1"],
+        marker="o",
+        linewidth=2,
+        label=model_name
+    )
+
+plt.xlabel("Missing-text ratio (%)")
+plt.ylabel("F1 score")
+plt.title("Leakage-free robustness under varying missing-text ratios")
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.legend()
+plt.tight_layout()
+
+missing_fig_path = "/content/missing_text_sensitivity_f1_leakage_free.png"
+plt.savefig(missing_fig_path, dpi=300, bbox_inches="tight")
+plt.show()
+
+print("Saved:", missing_fig_path)
+
+
+# ============================================================
+# 8) Plot: Noisy Text F1
+# ============================================================
+
+noisy_plot_df = reviewer_sensitivity[
+    reviewer_sensitivity["Degradation_Type"] == "Noisy Text"
+].copy()
+
+plt.figure(figsize=(8, 5))
+
+for model_name in noisy_plot_df["Model"].unique():
+    temp = noisy_plot_df[noisy_plot_df["Model"] == model_name]
+    plt.plot(
+        temp["Ratio_%"],
+        temp["F1"],
+        marker="o",
+        linewidth=2,
+        label=model_name
+    )
+
+plt.xlabel("Noisy-text ratio (%)")
+plt.ylabel("F1 score")
+plt.title("Leakage-free robustness under varying noisy-text ratios")
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.legend()
+plt.tight_layout()
+
+noisy_fig_path = "/content/noisy_text_sensitivity_f1_leakage_free.png"
+plt.savefig(noisy_fig_path, dpi=300, bbox_inches="tight")
+plt.show()
+
+print("Saved:", noisy_fig_path)
+
+
+# ============================================================
+# 9) Manuscript-ready summary
+# ============================================================
+
+print("\n================ MANUSCRIPT SUMMARY - LEAKAGE-FREE ================")
+
+summary_rows = []
+
+for degradation_type in ["Missing Text", "Noisy Text"]:
+    print(f"\n{degradation_type}:")
+
+    for model_name in reviewer_sensitivity["Model"].unique():
+        temp = reviewer_sensitivity[
+            (reviewer_sensitivity["Model"] == model_name)
+            & (reviewer_sensitivity["Degradation_Type"] == degradation_type)
+        ].sort_values("Ratio_%")
+
+        if len(temp) == 0:
+            continue
+
+        f1_0 = float(temp[temp["Ratio_%"] == 0]["F1"].values[0])
+        f1_30 = float(temp[temp["Ratio_%"] == 30]["F1"].values[0])
+        f1_50 = float(temp[temp["Ratio_%"] == 50]["F1"].values[0])
+
+        delta_30 = f1_30 - f1_0
+        delta_50 = f1_50 - f1_0
+
+        summary_rows.append({
+            "Model": model_name,
+            "Degradation_Type": degradation_type,
+            "F1_0%": f1_0,
+            "F1_30%": f1_30,
+            "F1_50%": f1_50,
+            "Delta_30%": delta_30,
+            "Delta_50%": delta_50,
+        })
+
+        print(
+            f"{model_name}: "
+            f"F1 at 0% = {f1_0:.4f}, "
+            f"F1 at 30% = {f1_30:.4f}, "
+            f"F1 at 50% = {f1_50:.4f}, "
+            f"Delta@50% = {delta_50:.4f}"
+        )
+
+summary_df = pd.DataFrame(summary_rows)
+
+for c in summary_df.columns:
+    if c not in ["Model", "Degradation_Type"]:
+        summary_df[c] = summary_df[c].astype(float).round(4)
+
+summary_path = "/content/robustness_sensitivity_summary_leakage_free.csv"
+summary_df.to_csv(summary_path, index=False)
+
+print("\n================ SUMMARY TABLE - LEAKAGE-FREE ================")
+display(summary_df)
+print("Saved:", summary_path)
+
+
+# ============================================================
+# 10) Final file list
+# ============================================================
+
+print("\nUse these files in the revised manuscript:")
+print("- /content/reviewer_robustness_sensitivity_table_leakage_free.csv")
+print("- /content/robustness_sensitivity_f1_pivot_leakage_free.csv")
+print("- /content/robustness_sensitivity_roc_auc_pivot_leakage_free.csv")
+print("- /content/robustness_sensitivity_pr_auc_pivot_leakage_free.csv")
+print("- /content/robustness_sensitivity_summary_leakage_free.csv")
+print("- /content/missing_text_sensitivity_f1_leakage_free.png")
+print("- /content/noisy_text_sensitivity_f1_leakage_free.png")
+print("- /content/robustness_sensitivity_full_results_leakage_free.csv")
