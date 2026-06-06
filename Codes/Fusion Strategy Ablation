@@ -1,1 +1,711 @@
 
+
+
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+
+from torch.utils.data import Dataset, DataLoader
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    matthews_corrcoef,
+    cohen_kappa_score,
+    brier_score_loss,
+    confusion_matrix,
+)
+
+
+
+ABL_DIR = "/content/fusion_ablation_reviewer"
+os.makedirs(ABL_DIR, exist_ok=True)
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+required_vars = [
+    "student_model",
+    "tab_model",
+    "text_tokenizer",
+    "t_tr", "t_va", "t_te",
+    "Xn_tr", "Xn_va", "Xn_te",
+    "Xc_tr", "Xc_va", "Xc_te",
+    "y_tr", "y_va", "y_te",
+    "DEVICE",
+    "MAX_LEN",
+]
+
+missing = [v for v in required_vars if v not in globals()]
+if missing:
+    raise RuntimeError(
+        "These variables are missing. Run the main SecureFusion-X code first:\n"
+        + str(missing)
+    )
+
+print("All required variables found.")
+print("Train/Val/Test sizes:", len(y_tr), len(y_va), len(y_te))
+
+
+
+
+def safe_roc_auc(y_true, y_prob):
+    try:
+        return float(roc_auc_score(y_true, y_prob))
+    except Exception:
+        return np.nan
+
+
+def safe_pr_auc(y_true, y_prob):
+    try:
+        return float(average_precision_score(y_true, y_prob))
+    except Exception:
+        return np.nan
+
+
+def best_threshold(y_true, y_prob):
+    grid = np.linspace(0.01, 0.99, 99)
+    f1s = [
+        f1_score(y_true, (y_prob >= t).astype(int), zero_division=0)
+        for t in grid
+    ]
+    idx = int(np.argmax(f1s))
+    return float(grid[idx]), float(f1s[idx])
+
+
+def compute_metrics(y_true, y_prob, threshold):
+    y_pred = (y_prob >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
+    return {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Balanced_Accuracy": balanced_accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred, zero_division=0),
+        "Recall": recall_score(y_true, y_pred, zero_division=0),
+        "Specificity": tn / (tn + fp + 1e-12),
+        "F1": f1_score(y_true, y_pred, zero_division=0),
+        "ROC_AUC": safe_roc_auc(y_true, y_prob),
+        "PR_AUC": safe_pr_auc(y_true, y_prob),
+        "MCC": matthews_corrcoef(y_true, y_pred),
+        "Brier": brier_score_loss(y_true, y_prob),
+        "Kappa": cohen_kappa_score(y_true, y_pred),
+        "FPR": fp / (fp + tn + 1e-12),
+        "Threshold": threshold,
+    }
+
+
+def print_metrics(name, metrics):
+    print("\n" + name)
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(f"{k}: {v:.4f}")
+        else:
+            print(f"{k}: {v}")
+
+
+def corrupt_texts_missing(texts, ratio=0.30, seed=42):
+    rng = np.random.default_rng(seed)
+    out = np.array(texts, dtype=object).copy()
+    n = len(out)
+    k = int(round(ratio * n))
+
+    if k <= 0:
+        return out
+
+    idx = rng.choice(n, size=k, replace=False)
+    out[idx] = ""
+    return out
+
+
+def corrupt_texts_noisy(texts, doc_ratio=0.30, token_ratio=0.30, seed=42):
+    rng = np.random.default_rng(seed)
+    out = np.array(texts, dtype=object).copy()
+    n = len(out)
+    k_docs = int(round(doc_ratio * n))
+
+    if k_docs <= 0:
+        return out
+
+    idx = rng.choice(n, size=k_docs, replace=False)
+
+    for i in idx:
+        tokens = str(out[i]).split()
+
+        if len(tokens) == 0:
+            continue
+
+        k_tokens = max(1, int(round(token_ratio * len(tokens))))
+        chosen = rng.choice(len(tokens), size=k_tokens, replace=False)
+
+        for j in chosen:
+            tokens[j] = "[UNK]"
+
+        out[i] = " ".join(tokens)
+
+    return out
+
+
+class TextOnlyDS(Dataset):
+    def __init__(self, texts):
+        self.texts = list(texts)
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        return self.texts[idx]
+
+
+def collate_text_only(batch):
+    enc = text_tokenizer(
+        list(batch),
+        padding=True,
+        truncation=True,
+        max_length=MAX_LEN,
+        return_tensors="pt",
+    )
+    return enc["input_ids"], enc["attention_mask"]
+
+
+class TabDS(Dataset):
+    def __init__(self, xnum, xcat):
+        self.xnum = xnum.astype(np.float32)
+        self.xcat = xcat.astype(np.int64)
+
+    def __len__(self):
+        return len(self.xnum)
+
+    def __getitem__(self, idx):
+        return {
+            "num": torch.tensor(self.xnum[idx], dtype=torch.float32),
+            "cat": torch.tensor(self.xcat[idx], dtype=torch.long),
+        }
+
+
+def extract_text_probs_embeddings(model, texts, batch_size=16):
+    loader = DataLoader(
+        TextOnlyDS(texts),
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_text_only,
+        num_workers=0,
+    )
+
+    model.eval()
+    probs_all = []
+    emb_all = []
+
+    with torch.no_grad():
+        for input_ids, attention_mask in loader:
+            input_ids = input_ids.to(DEVICE)
+            attention_mask = attention_mask.to(DEVICE)
+
+            outputs = model.bert(input_ids=input_ids, attention_mask=attention_mask)
+            cls = outputs.last_hidden_state[:, 0, :]
+
+            logits = model.classifier(model.dropout(cls)).squeeze(-1)
+            probs = torch.sigmoid(logits)
+
+            probs_all.append(probs.detach().cpu().numpy())
+            emb_all.append(cls.detach().cpu().numpy())
+
+    return np.concatenate(probs_all), np.concatenate(emb_all)
+
+
+def extract_tab_probs_embeddings(model, xnum, xcat, batch_size=256):
+    loader = DataLoader(
+        TabDS(xnum, xcat),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    model.eval()
+    probs_all = []
+    emb_all = []
+
+    with torch.no_grad():
+        for b in loader:
+            xn = b["num"].to(DEVICE)
+            xc = b["cat"].to(DEVICE)
+
+            h = model.backbone(xn, xc)
+            logits = model.head(h).squeeze(-1)
+            probs = torch.sigmoid(logits)
+
+            probs_all.append(probs.detach().cpu().numpy())
+            emb_all.append(h.detach().cpu().numpy())
+
+    return np.concatenate(probs_all), np.concatenate(emb_all)
+
+
+print("\nExtracting branch outputs...")
+
+p_text_tr, e_text_tr = extract_text_probs_embeddings(student_model, t_tr)
+p_text_va, e_text_va = extract_text_probs_embeddings(student_model, t_va)
+p_text_te, e_text_te = extract_text_probs_embeddings(student_model, t_te)
+
+p_tab_tr, e_tab_tr = extract_tab_probs_embeddings(tab_model, Xn_tr, Xc_tr)
+p_tab_va, e_tab_va = extract_tab_probs_embeddings(tab_model, Xn_va, Xc_va)
+p_tab_te, e_tab_te = extract_tab_probs_embeddings(tab_model, Xn_te, Xc_te)
+
+print("Text embeddings:", e_text_tr.shape, e_text_va.shape, e_text_te.shape)
+print("Tab embeddings:", e_tab_tr.shape, e_tab_va.shape, e_tab_te.shape)
+
+
+
+t_te_missing = corrupt_texts_missing(t_te, ratio=0.30, seed=SEED)
+t_te_noisy = corrupt_texts_noisy(
+    t_te,
+    doc_ratio=0.30,
+    token_ratio=0.30,
+    seed=SEED,
+)
+
+p_text_te_missing, e_text_te_missing = extract_text_probs_embeddings(student_model, t_te_missing)
+p_text_te_noisy, e_text_te_noisy = extract_text_probs_embeddings(student_model, t_te_noisy)
+
+# Tabular modality is unchanged because only text is degraded.
+p_tab_te_missing = p_tab_te.copy()
+p_tab_te_noisy = p_tab_te.copy()
+
+e_tab_te_missing = e_tab_te.copy()
+e_tab_te_noisy = e_tab_te.copy()
+
+
+
+
+X_dec_tr = np.vstack([p_text_tr, p_tab_tr]).T
+X_dec_va = np.vstack([p_text_va, p_tab_va]).T
+X_dec_te = np.vstack([p_text_te, p_tab_te]).T
+
+X_dec_te_missing = np.vstack([p_text_te_missing, p_tab_te_missing]).T
+X_dec_te_noisy = np.vstack([p_text_te_noisy, p_tab_te_noisy]).T
+
+if "decision_fusion" in globals() and "thr_fusion" in globals():
+    print("\nUsing the already tuned decision_fusion and thr_fusion from the main code.")
+
+    decision_model = decision_fusion
+    thr_dec = float(thr_fusion)
+
+    p_dec_te = decision_model.predict_proba(X_dec_te)[:, 1]
+    p_dec_te_missing = decision_model.predict_proba(X_dec_te_missing)[:, 1]
+    p_dec_te_noisy = decision_model.predict_proba(X_dec_te_noisy)[:, 1]
+
+else:
+    print("\nNo tuned decision_fusion found. Training a fresh decision-level LR baseline.")
+
+    decision_model = LogisticRegression(
+        C=1.0,
+        max_iter=2000,
+        random_state=SEED,
+        solver="lbfgs",
+    )
+
+    decision_model.fit(X_dec_tr, y_tr)
+
+    p_dec_va = decision_model.predict_proba(X_dec_va)[:, 1]
+    thr_dec, _ = best_threshold(y_va, p_dec_va)
+
+    p_dec_te = decision_model.predict_proba(X_dec_te)[:, 1]
+    p_dec_te_missing = decision_model.predict_proba(X_dec_te_missing)[:, 1]
+    p_dec_te_noisy = decision_model.predict_proba(X_dec_te_noisy)[:, 1]
+
+print_metrics("Decision-level LR | Clean", compute_metrics(y_te, p_dec_te, thr_dec))
+print_metrics("Decision-level LR | 30% Missing Text", compute_metrics(y_te, p_dec_te_missing, thr_dec))
+print_metrics("Decision-level LR | 30% Noisy Text", compute_metrics(y_te, p_dec_te_noisy, thr_dec))
+
+
+
+class FusionArrayDS(Dataset):
+    def __init__(self, X, y):
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.float32)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.X[idx], dtype=torch.float32),
+            torch.tensor(self.y[idx], dtype=torch.float32),
+        )
+
+
+class FeatureConcatMLP(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.GELU(),
+            nn.Dropout(0.25),
+            nn.Linear(256, 64),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def train_mlp_fusion(
+    X_tr,
+    y_tr,
+    X_va,
+    y_va,
+    max_epochs=30,
+    batch_size=64,
+    lr=1e-3,
+    patience=6,
+):
+    model = FeatureConcatMLP(X_tr.shape[1]).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    crit = nn.BCEWithLogitsLoss()
+
+    tr_loader = DataLoader(FusionArrayDS(X_tr, y_tr), batch_size=batch_size, shuffle=True)
+    va_loader = DataLoader(FusionArrayDS(X_va, y_va), batch_size=batch_size, shuffle=False)
+
+    best_state = None
+    best_f1 = -1.0
+    bad = 0
+
+    for ep in range(1, max_epochs + 1):
+        model.train()
+
+        for xb, yb in tr_loader:
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+
+            logits = model(xb)
+            loss = crit(logits, yb)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+        model.eval()
+        va_probs = []
+
+        with torch.no_grad():
+            for xb, _ in va_loader:
+                xb = xb.to(DEVICE)
+                va_probs.append(torch.sigmoid(model(xb)).cpu().numpy())
+
+        va_probs = np.concatenate(va_probs)
+        _, va_f1 = best_threshold(y_va, va_probs)
+
+        print(f"[Feature Concat Fusion][Epoch {ep}] val_f1={va_f1:.4f}")
+
+        if va_f1 > best_f1 + 1e-4:
+            best_f1 = va_f1
+            bad = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                print("Feature-level concatenation early stopping")
+                break
+
+    if best_state is None:
+        raise RuntimeError("Feature-level concatenation did not produce a valid checkpoint.")
+
+    model.load_state_dict(best_state)
+    return model
+
+
+def predict_mlp(model, X, batch_size=256):
+    loader = DataLoader(
+        FusionArrayDS(X, np.zeros(len(X))),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model.eval()
+    probs = []
+
+    with torch.no_grad():
+        for xb, _ in loader:
+            xb = xb.to(DEVICE)
+            probs.append(torch.sigmoid(model(xb)).cpu().numpy())
+
+    return np.concatenate(probs)
+
+
+X_feat_tr = np.concatenate([e_text_tr, e_tab_tr], axis=1)
+X_feat_va = np.concatenate([e_text_va, e_tab_va], axis=1)
+X_feat_te = np.concatenate([e_text_te, e_tab_te], axis=1)
+
+X_feat_te_missing = np.concatenate([e_text_te_missing, e_tab_te_missing], axis=1)
+X_feat_te_noisy = np.concatenate([e_text_te_noisy, e_tab_te_noisy], axis=1)
+
+print("\nTraining feature-level concatenation baseline...")
+
+concat_model = train_mlp_fusion(X_feat_tr, y_tr, X_feat_va, y_va)
+
+p_concat_va = predict_mlp(concat_model, X_feat_va)
+thr_concat, _ = best_threshold(y_va, p_concat_va)
+
+p_concat_te = predict_mlp(concat_model, X_feat_te)
+p_concat_te_missing = predict_mlp(concat_model, X_feat_te_missing)
+p_concat_te_noisy = predict_mlp(concat_model, X_feat_te_noisy)
+
+
+
+class PairFeatureDS(Dataset):
+    def __init__(self, et, eb, y):
+        self.et = et.astype(np.float32)
+        self.eb = eb.astype(np.float32)
+        self.y = y.astype(np.float32)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.et[idx], dtype=torch.float32),
+            torch.tensor(self.eb[idx], dtype=torch.float32),
+            torch.tensor(self.y[idx], dtype=torch.float32),
+        )
+
+
+class AttentionFeatureFusion(nn.Module):
+    def __init__(self, text_dim, tab_dim, d_model=128, heads=4):
+        super().__init__()
+
+        self.text_proj = nn.Linear(text_dim, d_model)
+        self.tab_proj = nn.Linear(tab_dim, d_model)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=heads,
+            dropout=0.10,
+            batch_first=True,
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+
+        self.head = nn.Sequential(
+            nn.Linear(2 * d_model, 128),
+            nn.GELU(),
+            nn.Dropout(0.20),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, et, eb):
+        ht = self.text_proj(et).unsqueeze(1)
+        hb = self.tab_proj(eb).unsqueeze(1)
+
+        tokens = torch.cat([ht, hb], dim=1)
+
+        attended, _ = self.attn(tokens, tokens, tokens)
+        attended = self.norm(attended + tokens)
+
+        z = attended.reshape(attended.size(0), -1)
+
+        return self.head(z).squeeze(-1)
+
+
+def train_attention_fusion(
+    et_tr,
+    eb_tr,
+    y_tr,
+    et_va,
+    eb_va,
+    y_va,
+    max_epochs=30,
+    batch_size=64,
+    lr=1e-3,
+    patience=6,
+):
+    model = AttentionFeatureFusion(et_tr.shape[1], eb_tr.shape[1]).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    crit = nn.BCEWithLogitsLoss()
+
+    tr_loader = DataLoader(PairFeatureDS(et_tr, eb_tr, y_tr), batch_size=batch_size, shuffle=True)
+    va_loader = DataLoader(PairFeatureDS(et_va, eb_va, y_va), batch_size=batch_size, shuffle=False)
+
+    best_state = None
+    best_f1 = -1.0
+    bad = 0
+
+    for ep in range(1, max_epochs + 1):
+        model.train()
+
+        for et, eb, yb in tr_loader:
+            et = et.to(DEVICE)
+            eb = eb.to(DEVICE)
+            yb = yb.to(DEVICE)
+
+            logits = model(et, eb)
+            loss = crit(logits, yb)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+        model.eval()
+        va_probs = []
+
+        with torch.no_grad():
+            for et, eb, _ in va_loader:
+                et = et.to(DEVICE)
+                eb = eb.to(DEVICE)
+                va_probs.append(torch.sigmoid(model(et, eb)).cpu().numpy())
+
+        va_probs = np.concatenate(va_probs)
+        _, va_f1 = best_threshold(y_va, va_probs)
+
+        print(f"[Attention Feature Fusion][Epoch {ep}] val_f1={va_f1:.4f}")
+
+        if va_f1 > best_f1 + 1e-4:
+            best_f1 = va_f1
+            bad = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                print("Attention-based feature fusion early stopping")
+                break
+
+    if best_state is None:
+        raise RuntimeError("Attention-based feature fusion did not produce a valid checkpoint.")
+
+    model.load_state_dict(best_state)
+    return model
+
+
+def predict_attention(model, et, eb, batch_size=256):
+    loader = DataLoader(
+        PairFeatureDS(et, eb, np.zeros(len(et))),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model.eval()
+    probs = []
+
+    with torch.no_grad():
+        for xt, xb, _ in loader:
+            xt = xt.to(DEVICE)
+            xb = xb.to(DEVICE)
+            probs.append(torch.sigmoid(model(xt, xb)).cpu().numpy())
+
+    return np.concatenate(probs)
+
+
+print("\nTraining attention-based feature-level fusion baseline...")
+
+attn_model = train_attention_fusion(e_text_tr, e_tab_tr, y_tr, e_text_va, e_tab_va, y_va)
+
+p_attn_va = predict_attention(attn_model, e_text_va, e_tab_va)
+thr_attn, _ = best_threshold(y_va, p_attn_va)
+
+p_attn_te = predict_attention(attn_model, e_text_te, e_tab_te)
+p_attn_te_missing = predict_attention(attn_model, e_text_te_missing, e_tab_te_missing)
+p_attn_te_noisy = predict_attention(attn_model, e_text_te_noisy, e_tab_te_noisy)
+
+
+
+
+records = []
+
+def add_record(model_name, setting, y_true, p, thr):
+    row = {
+        "Fusion Strategy": model_name,
+        "Setting": setting,
+    }
+    row.update(compute_metrics(y_true, p, thr))
+    records.append(row)
+
+
+add_record("Decision-level LR", "Clean", y_te, p_dec_te, thr_dec)
+add_record("Decision-level LR", "30% Missing Text", y_te, p_dec_te_missing, thr_dec)
+add_record("Decision-level LR", "30% Noisy Text", y_te, p_dec_te_noisy, thr_dec)
+
+add_record("Feature-level Concatenation", "Clean", y_te, p_concat_te, thr_concat)
+add_record("Feature-level Concatenation", "30% Missing Text", y_te, p_concat_te_missing, thr_concat)
+add_record("Feature-level Concatenation", "30% Noisy Text", y_te, p_concat_te_noisy, thr_concat)
+
+add_record("Feature-level Attention", "Clean", y_te, p_attn_te, thr_attn)
+add_record("Feature-level Attention", "30% Missing Text", y_te, p_attn_te_missing, thr_attn)
+add_record("Feature-level Attention", "30% Noisy Text", y_te, p_attn_te_noisy, thr_attn)
+
+ablation_df = pd.DataFrame(records)
+
+clean_f1_map = (
+    ablation_df[ablation_df["Setting"] == "Clean"]
+    .set_index("Fusion Strategy")["F1"]
+    .to_dict()
+)
+
+ablation_df["Delta_F1_vs_Clean"] = ablation_df.apply(
+    lambda r: r["F1"] - clean_f1_map[r["Fusion Strategy"]],
+    axis=1,
+)
+
+# Round numeric columns for display
+ablation_display = ablation_df.copy()
+for c in ablation_display.columns:
+    if c not in ["Fusion Strategy", "Setting"]:
+        ablation_display[c] = ablation_display[c].astype(float).round(4)
+
+print("\n================ FUSION STRATEGY ABLATION - FULL ================")
+display(ablation_display)
+
+out_csv = os.path.join(ABL_DIR, "fusion_strategy_ablation_full.csv")
+ablation_display.to_csv(out_csv, index=False)
+
+
+# Compact F1 table for manuscript/rebuttal
+compact = ablation_df.pivot(
+    index="Fusion Strategy",
+    columns="Setting",
+    values="F1",
+)
+
+compact = compact[["Clean", "30% Missing Text", "30% Noisy Text"]].reset_index()
+
+compact["Drop under Missing"] = compact["30% Missing Text"] - compact["Clean"]
+compact["Drop under Noisy"] = compact["30% Noisy Text"] - compact["Clean"]
+
+compact_display = compact.copy()
+for c in compact_display.columns:
+    if c != "Fusion Strategy":
+        compact_display[c] = compact_display[c].astype(float).round(4)
+
+print("\n================ FUSION STRATEGY ABLATION - COMPACT F1 ================")
+display(compact_display)
+
+compact_csv = os.path.join(ABL_DIR, "fusion_strategy_ablation_compact_f1.csv")
+compact_display.to_csv(compact_csv, index=False)
+
+latex_path = os.path.join(ABL_DIR, "fusion_strategy_ablation_compact_f1.tex")
+with open(latex_path, "w", encoding="utf-8") as f:
+    f.write(compact_display.to_latex(index=False, escape=False))
+
+print("\nSaved files:")
+print(out_csv)
+print(compact_csv)
+print(latex_path)
+
+print("\nThresholds:")
+print("Decision-level LR:", thr_dec)
+print("Feature-level concatenation:", thr_concat)
+print("Feature-level attention:", thr_attn)
+
+print("\nDone.")
