@@ -1,0 +1,12 @@
+Component,Parameters,Model_Size,Estimated_Operations,Inference_Time
+TextGuard-Lite student,19.16M,73.11 MB,>=2.72 GFLOPs per sample,6.84 ms per sample
+TabShield-Net,4.11M,15.67 MB,approximately 0.024 GFLOPs per sample,--
+Fusion meta-classifier,300%,approximately 0 MB,negligible,approximately 0.000001 ms per sample
+Full 2024 inference,--,--,--,2.9479 s total
+Threshold-only adaptation,0 trainable,--,--,0.1545 s
+Fusion-only refit,3 trainable,--,--,2.5703 s
+,,,,
+,,,,
+,,,,
+,,,,
+,,,,

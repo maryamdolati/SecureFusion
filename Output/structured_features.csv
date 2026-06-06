@@ -1,0 +1,12 @@
+Feature_Group,Count,Type,Examples,Delta_Missing,Delta_Noisy
+CVSS v3 vector components,8.00E+00,Categorical,"AV, AC, PR, UI, S, C, I, A",0.0008,0.0008
+CWE identifiers,2.00E+00,Categorical,"CWE main, CWE all",0.0007,0.0008
+CPE-derived identifiers,1.00E+00,Categorical,CPE-derived category indicator,0.0023,0.0015
+Vendor and product identifiers,2,Categorical,Vendor and product identifiers,,
+Other categorical metadata,12,Categorical,"Vulnerability status, CVSS version, source identifier, temporal categories",,
+,,,,,
+,,,,,
+,,,,,
+,,,,,
+,,,,,
+,,,,,

@@ -1,0 +1,12 @@
+Component,Learning_Rate_or_Key_Parameter,Epochs_and_Batch_Size,Noisy_30_F1,Delta_Missing,Delta_Noisy
+Text Encoder (Teacher MiniLM),3.00E-05,"10 epochs, batch = 8",0.9806,0.0008,0.0008
+Text Encoder (Student),3.00E-05,"6 epochs, batch = 8",0.9821,0.0007,0.0008
+TabShield-Net (TabTransformer),5.00E-04,"50 epochs, batch = 256",0.9798,0.0023,0.0015
+SecureFusion-X (Fusion Meta-Model),C = 1.0,threshold = 0.74,,,
+Optimizer,AdamW with gradient clipping for neural branches,Regularized logistic regression for fusion,,,
+,,,,,
+,,,,,
+,,,,,
+,,,,,
+,,,,,
+,,,,,

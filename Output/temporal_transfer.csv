@@ -1,0 +1,6 @@
+Setting,Model,Adaptation,F1,ROC_AUC,PR_AUC,MCC,FPR,Adaptation_Time_s
+Temporal transfer,TextGuard-Lite,None,0.1662 ñ 0.0174,0.7961 ñ 0.0205,0.1233 ñ 0.0105,0.1637 ñ 0.0239,0.1141 ñ 0.0047,--
+Temporal transfer,TabShield-Net,None,0.3880 ñ 0.0219,0.9098 ñ 0.0178,0.3824 ñ 0.0313,0.4217 ñ 0.0269,0.0668 ñ 0.0030,--
+Zero-shot transfer,SecureFusion-X,None,0.3970 ñ 0.0323,0.8634 ñ 0.0250,0.3304 ñ 0.0343,0.4093 ñ 0.0365,0.0511 ñ 0.0033,--
+Few-shot transfer,SecureFusion-X,Threshold-only,0.3296 ñ 0.0846,0.8634 ñ 0.0250,0.3304 ñ 0.0343,0.3525 ñ 0.0615,0.0871 ñ 0.0576,0.1545 ñ 0.0208
+Few-shot transfer,SecureFusion-X,Fusion-only refit,0.3939 ñ 0.0318,0.8629 ñ 0.0247,0.3293 ñ 0.0339,0.4067 ñ 0.0360,0.0519 ñ 0.0036,2.5703 ñ 0.3575

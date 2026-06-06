@@ -1,0 +1,10 @@
+Work,Year,Modalities,Fusion_Strategy,Resilience,Efficiency,Objective
+Bozorgi et al.,2010,"Text, Tabular",Early Fusion (SVM),No,Low,Exploitability
+Jacobs et al.,2023,"Behavioral, Tabular",Probabilistic,No,High,Exploitability
+Kai et al.,2023,Text,Unimodal,No,High (Distilled),Severity
+Iannone et al.,2024,"Text, Tabular",Feature Concatenation,No,Moderate,Exploitability
+Lim et al.,2024,"Text, Code, Tabular",Decision-level,No,Moderate,Severity
+Mahbub et al.,2025,"Graph, Metadata",Relational Embedding,No,Moderate,Exploitability
+Xu et al.,2025,"Text, Graph",Heterogeneous Graph,No,Low,Exploitability
+Mirtaheri et al.,2025,Text,Unimodal,No,High (Green AI),Exploitability
+SecureFusion-X,2026,"Text, Tabular",Decision-level Meta-Classifier,Yes,High (Distilled),Exploitability
